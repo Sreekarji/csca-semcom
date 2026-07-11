@@ -13,9 +13,9 @@ class HANNetwork(nn.Module):
 
     def __init__(
         self,
-        hidden_channels: int = 128,
+        hidden_channels: int = 256,
         num_heads: int = 8,
-        num_layers: int = 2,
+        num_layers: int = 3,
         dropout: float = 0.1,
         n_cscas: int = 5,
         n_relays: int = 5,
@@ -84,7 +84,6 @@ class HANNetwork(nn.Module):
             for nt in x_dict:
                 if nt in x_dict_new and x_dict_new[nt] is not None:
                     x_dict[nt] = self.norm(x_dict_new[nt] + x_dict[nt])
-                # else: keep x_dict[nt] unchanged (init node, etc.)
 
         # Graph embedding GL_t: mean pool all node embeddings
         all_embeddings = torch.cat(
@@ -94,30 +93,26 @@ class HANNetwork(nn.Module):
 
         return graph_embedding, x_dict
 
-    def encode_state(self, system_state: dict = None):
-        data = self.graph_builder.build(system_state)
+    def encode_state(self, system_state: dict = None,
+                     intent_vectors: list = None):
+        """
+        Encode system state into graph embedding + per-message embeddings.
+        intent_vectors: list of [delay_urgency, quality_req] per task.
+        Returns: graph_emb [1, 128], node_embs dict, message_embs [n_tasks, 128]
+        """
+        data = self.graph_builder.build(
+            system_state, intent_vectors=intent_vectors
+        )
         device = next(self.parameters()).device
         data = data.to(device)
-        return self.forward(data)
+        graph_emb, node_embs = self.forward(data)
 
+        # Return per-message embeddings for task-specific policy
+        if "message" in node_embs:
+            message_embs = node_embs["message"]  # [n_messages, 128]
+        else:
+            message_embs = graph_emb.expand(
+                self.graph_builder.n_messages, -1
+            )
 
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    han = HANNetwork(
-        hidden_channels=128,
-        num_heads=8,
-        num_layers=2,
-        n_cscas=5,
-        n_relays=5,
-        n_messages=5,
-        n_base_stations=5,
-    ).to(device)
-
-    graph_emb, node_embs = han.encode_state()
-    print(f"Graph embedding shape: {graph_emb.shape}")
-    print(f"Expected: torch.Size([1, 128])")
-    for nt, emb in node_embs.items():
-        print(f"  {nt} embeddings: {emb.shape}")
-    print("HAN test passed.")
+        return graph_emb, node_embs, message_embs

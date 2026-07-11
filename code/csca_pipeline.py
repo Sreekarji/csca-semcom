@@ -68,7 +68,7 @@ class CSCAPipeline:
         # Layer 2: HDM
         log("Initializing HAN network...")
         self.han = HANNetwork(
-            hidden_channels=128,
+            hidden_channels=256,
             num_heads=8,
             num_layers=2,
             n_cscas=n_cscas,
@@ -80,12 +80,12 @@ class CSCAPipeline:
         log("Initializing DDPM policy...")
         self.policy = HDMPolicy(
             action_dim=action_dim,
-            graph_emb_dim=128,
+            graph_emb_dim=256,
             n_denoising_steps=n_denoising_steps,
         ).to(self.device)
 
         self.critic = CriticNetwork(
-            state_dim=128,
+            state_dim=256,
             action_dim=action_dim,
         ).to(self.device)
 
@@ -115,8 +115,13 @@ class CSCAPipeline:
         return self.intent_parser.parse(user_text)
 
     def generate_policy(self, intent_result: dict, system_state: dict = None):
-        graph_emb, node_embs = self.han.encode_state(system_state)
-        action = self.policy(graph_emb)
+        intent_vector = intent_result.get("intent_vector", [0.9, 0.8])
+        intent_vectors = [intent_vector] * self.n_cscas
+
+        graph_emb, node_embs, message_embs = self.han.encode_state(
+            system_state, intent_vectors=intent_vectors
+        )
+        action = self.policy(graph_emb, message_embs=message_embs)
         parsed = self.policy.parse_action(
             action, self.n_cscas, self.n_relays, self.n_mcs
         )

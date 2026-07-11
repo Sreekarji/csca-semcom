@@ -1,0 +1,43 @@
+=== KEY RESULTS — CSCA IMPLEMENTATION ===
+Date: 2026-07-10
+
+1. ISR vs TASKS (paper methodology: 5 CSCAs × tasks_per_CSCA):
+   tasks_per_csca=2  (total=10):  HDM=0.188, SAC=0.198
+   tasks_per_csca=4  (total=20):  HDM=0.207, SAC=0.193  [HDM WINS]
+   tasks_per_csca=6  (total=30):  HDM=0.191, SAC=0.197
+   tasks_per_csca=8  (total=40):  HDM=0.190, SAC=0.212
+   tasks_per_csca=10 (total=50):  HDM=0.187, SAC=0.206
+   tasks_per_csca=12 (total=60):  HDM=0.194, SAC=0.217
+   tasks_per_csca=14 (total=70):  HDM=0.198, SAC=0.213
+   tasks_per_csca=16 (total=80):  HDM=0.199, SAC=0.204
+   tasks_per_csca=18 (total=90):  HDM=0.196, SAC=0.202
+   tasks_per_csca=20 (total=100): HDM=0.192, SAC=0.207
+   KEY FINDING: HDM wins at total=20 tasks. Otherwise SAC leads by 1-12%.
+
+2. SCALE COMPARISON (ISR at increasing task counts, n_cscas=5):
+   n=2:  HDM=0.213, SAC=0.200, Static=0.203  [HDM +6.5% over SAC]
+   n=5:  HDM=0.087, SAC=0.085, Static=0.087  [near parity]
+   n=8:  HDM=0.040, SAC=0.039, Static=0.039  [HDM +2.6%]
+   n=10: HDM=0.033, SAC=0.028, Static=0.029  [HDM +17.9%]
+   n=12: HDM=0.022, SAC=0.017, Static=0.017  [HDM +29.4%]
+   n=15: HDM=0.015, SAC=0.009, Static=0.010  [HDM +66.7%]
+   n=18: HDM=0.010, SAC=0.004, Static=0.003  [HDM +150%]
+   n=20: HDM=0.009, SAC=0.002, Static=0.002  [HDM +350%]
+   KEY FINDING: HDM advantage grows with network scale — matches paper's
+   qualitative result in Section VI.C.
+
+3. DELAY COMPARISON:
+   HDM delay: 13-14s (all task counts)
+   SAC delay: 8-9s (all task counts)
+   HDM is 60-80% SLOWER than baselines (paper claims -33.40% reduction)
+
+4. MULTIMODAL EVALUATION (real datasets):
+   Text semantic similarity:  0.974 (SST-2, 2000 sentences)
+   Audio semantic similarity: 0.988 (VoxCeleb, 4874 clips)
+   Image semantic similarity: 0.999 (Oxford Buildings, 3678 images)
+
+5. TRAINING STATUS:
+   HDM trained: 500 episodes, Eq. 33 actor loss, cumulative reward
+   High-pressure environment: 10MHz BW, 3-5MB data, 0.4-0.6s delay intent
+   Pure CSCQI reward (Eq. 17), batch size 256, LR 0.001 (Table II)
+   Curriculum learning: Easy → Medium → Hard

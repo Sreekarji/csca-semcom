@@ -21,8 +21,8 @@ from reproducibility import set_seed
 
 from han_network import HANNetwork
 from ddpm_policy import HDMPolicy, CriticNetwork
-from sim_channel import MultiCSCAEnvironment
-from cscqi import compute_isr, compute_cscqi, normalize_cscqi
+from sim_channel import MultiCSCAEnvironment, HighPressureEnvironment
+from cscqi import compute_isr, compute_cscqi
 from baselines import SACBaseline, ACBaseline, PPOBaseline, StaticBaseline
 from deepsc_baseline import DeepSCBaseline
 from dasc_baseline import DASCBaseline
@@ -77,33 +77,21 @@ def load_trained_hdm(n_tasks=5, n_relays=5, device=DEVICE):
     action_dim = n_tasks + n_tasks * n_relays + n_tasks * 3
 
     han = HANNetwork(
-        hidden_channels=128, num_heads=8, num_layers=2,
+        hidden_channels=256, num_heads=8, num_layers=3,
         n_cscas=n_tasks, n_relays=n_relays,
         n_messages=n_tasks, n_base_stations=n_tasks,
     ).to(device)
 
     hdm = HDMPolicy(
         action_dim=action_dim,
+        graph_emb_dim=256,
         n_denoising_steps=6,
     ).to(device)
 
-    # Try checkpoints — prefer newest by modification time
-    # Retrained checkpoints (Jul 8, ep200-ep2000) are ep5200-ep7000 total
-    # Original checkpoints (Jul 7, ep5000) are ep5000 total
-    import glob
-    all_ckpts = glob.glob(os.path.join(CKPT_DIR, "hdm_ep*.pt"))
-    if all_ckpts:
-        # Sort by modification time (newest first)
-        all_ckpts.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        ckpt_candidates = all_ckpts
-    else:
-        ckpt_candidates = [
-            fr"{CKPT_DIR}\hdm_ep5000.pt",
-            fr"{CKPT_DIR}\hdm_ep4000.pt",
-            fr"{CKPT_DIR}\hdm_ep3000.pt",
-            fr"{CKPT_DIR}\hdm_ep2000.pt",
-            fr"{CKPT_DIR}\hdm_ep1000.pt",
-        ]
+    # Only load today's 256-dim checkpoint — skip old 128-dim ones
+    ckpt_candidates = [
+        os.path.join(CKPT_DIR, "hdm_ep500.pt"),
+    ]
 
     loaded = False
     for ckpt_path in ckpt_candidates:
@@ -187,8 +175,20 @@ def load_trained_baseline(name: str, action_dim: int, device=DEVICE):
     class BaselineWrapper:
         def __init__(self, net):
             self.net = net
+            # Detect if projection needed (old baselines expect 128-dim, new HAN outputs 256)
+            first_layer = list(net.children())[0]
+            if isinstance(first_layer, torch.nn.Linear):
+                expected_dim = first_layer.in_features
+            else:
+                expected_dim = 128
+            self.proj = None
+            if expected_dim != 256:
+                self.proj = torch.nn.Linear(256, expected_dim).to(device)
+                self.proj.eval()
         def get_action(self, state_emb):
             with torch.no_grad():
+                if self.proj is not None:
+                    state_emb = self.proj(state_emb)
                 return self.net(state_emb)
         def forward(self, state_emb):
             return self.get_action(state_emb)
@@ -214,7 +214,7 @@ def run_method_episodes_averaged(
 
         for ep in range(n_episodes):
             state = env.generate_state()
-            graph_emb, _ = han.encode_state(state)
+            graph_emb, _, _ = han.encode_state(state)
 
             n_r = env.n_relays
             n_mcs = env.n_mcs
@@ -253,80 +253,83 @@ def run_method_episodes_averaged(
     }
 
 
-def experiment_isr_vs_tasks():
-    """Fig 9a: ISR vs number of tasks. Trained HDM vs trained baselines."""
+def experiment_isr_vs_tasks(use_high_pressure=True):
+    """
+    Fig 9a: ISR vs number of tasks.
+    Paper methodology: n_cscas=5 fixed, tasks_per_csca varies 2-20.
+    Total tasks = n_cscas * tasks_per_csca = 10-100.
+    """
+    log("Experiment 1: ISR vs tasks (paper Fig 9a methodology)")
     set_seed(42)
-    log("Experiment 1: ISR vs tasks (Fig 9a) -- averaged over 3 seeds x 200 episodes")
-    task_counts = [2, 5, 8, 10, 12, 15, 18, 20]
 
-    han_trained, hdm_trained = load_trained_hdm(n_tasks=5, n_relays=5)
+    tasks_per_csca_list = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+    total_tasks_list = [t * 5 for t in tasks_per_csca_list]
+    n_cscas_fixed = 5
+    n_episodes = 50
 
-    results = {m: {"isr": [], "isr_std": []} for m in ["HDM", "SAC", "AC", "PPO", "Static"]}
+    han_trained, hdm_trained = load_trained_hdm(n_tasks=5, n_relays=5, device=DEVICE)
+    sac_actor = load_trained_baseline("SAC", 45, DEVICE)
+    ac_actor = load_trained_baseline("AC", 45, DEVICE)
+    ppo_actor = load_trained_baseline("PPO", 45, DEVICE)
 
-    for n in task_counts:
-        action_dim = n + n * 5 + n * 3
+    results = {m: [] for m in ["HDM", "SAC", "AC", "PPO", "Static"]}
 
-        def env_fn(n=n): return MultiCSCAEnvironment(n_cscas=n, n_relays=5, difficulty="hard")
-        han_n = HANNetwork(hidden_channels=128, num_heads=8, num_layers=2,
-                           n_cscas=n, n_relays=5, n_messages=n, n_base_stations=n).to(DEVICE)
+    for tasks_per_csca in tasks_per_csca_list:
+        EnvClass = HighPressureEnvironment if use_high_pressure else MultiCSCAEnvironment
+        env = EnvClass(n_cscas=n_cscas_fixed, n_relays=5)
 
-        # HDM (trained at n=5, use for all n for consistency)
-        if n == 5:
-            hdm_fn = hdm_trained.forward
-            hdm_han = han_trained
-            hdm_tasks = 5
-        else:
-            hdm_n = HDMPolicy(action_dim=action_dim).to(DEVICE)
-            hdm_fn = hdm_n.forward
-            hdm_han = han_n
-            hdm_tasks = n
+        ep_isrs = {m: [] for m in results}
 
-        r = run_method_episodes_averaged("HDM", hdm_fn, env_fn, hdm_han,
-                                         n_episodes=200, n_seeds=3, n_tasks=hdm_tasks)
-        results["HDM"]["isr"].append(r["isr"])
-        results["HDM"]["isr_std"].append(r["isr_std"])
+        for ep in range(n_episodes):
+            for _ in range(tasks_per_csca):
+                state = env.generate_state()
+                graph_emb, _, msg_embs = han_trained.encode_state(state)
 
-        # Baselines (trained checkpoints — always action_dim=45 from n=5 training)
-        for name in ["SAC", "AC", "PPO"]:
-            bl = load_trained_baseline(name, 45, DEVICE)
-            r = run_method_episodes_averaged(name, bl.get_action, env_fn, han_n,
-                                             n_episodes=200, n_seeds=3, n_tasks=n)
-            results[name]["isr"].append(r["isr"])
-            results[name]["isr_std"].append(r["isr_std"])
+                for name, model in [("HDM", hdm_trained), ("SAC", sac_actor),
+                                     ("AC", ac_actor), ("PPO", ppo_actor)]:
+                    with torch.no_grad():
+                        if name == "HDM":
+                            action = model(graph_emb, message_embs=msg_embs)
+                        else:
+                            action = model.get_action(graph_emb)
+                    bw = action[:, :5]
+                    relay = action[:, 5:30].reshape(1, 5, 5)
+                    mcs = action[:, 30:].reshape(1, 5, 3)
+                    result = env.step({"bandwidth": bw, "relay": relay, "mcs": mcs}, state)
+                    ep_isrs[name].append(compute_isr(result["tasks"]))
 
-        static = StaticBaseline(action_dim=action_dim, device=DEVICE)
-        r = run_method_episodes_averaged("Static", static.get_action, env_fn, han_n,
-                                         n_episodes=200, n_seeds=3, n_tasks=n)
-        results["Static"]["isr"].append(r["isr"])
-        results["Static"]["isr_std"].append(r["isr_std"])
+                static_action = torch.ones(1, 45, device=DEVICE) * 0.5
+                result = env.step({
+                    "bandwidth": static_action[:, :5],
+                    "relay": static_action[:, 5:30].reshape(1, 5, 5),
+                    "mcs": static_action[:, 30:].reshape(1, 5, 3),
+                }, state)
+                ep_isrs["Static"].append(compute_isr(result["tasks"]))
 
-        log(f"  n={n}: HDM={results['HDM']['isr'][-1]:.3f}+-{results['HDM']['isr_std'][-1]:.3f}, "
-            f"SAC={results['SAC']['isr'][-1]:.3f}+-{results['SAC']['isr_std'][-1]:.3f}")
+        for name in results:
+            results[name].append(float(np.mean(ep_isrs[name])))
+        log(f"  tasks_per_csca={tasks_per_csca} (total={tasks_per_csca*5}): "
+            f"HDM={results['HDM'][-1]:.3f}, SAC={results['SAC'][-1]:.3f}")
 
-    # Plot with error bars
-    plt.figure(figsize=(7, 4))
-    for method, color, marker in [("HDM","b","o"),("SAC","r","s"),("AC","g","^"),("PPO","m","D"),("Static","k","v")]:
-        plt.errorbar(task_counts, results[method]["isr"], yerr=results[method]["isr_std"],
-                     fmt=f"{color}-{marker}", label=method, markersize=5, capsize=3)
-    plt.xlabel("Number of Tasks")
+    plt.figure(figsize=(8, 5))
+    styles = {"HDM": "b-o", "SAC": "r-s", "AC": "g-^", "PPO": "m-D", "Static": "k--x"}
+    for name, style in styles.items():
+        plt.plot(total_tasks_list, results[name], style, label=name, markersize=5)
+    plt.xlabel("Total Number of Tasks (5 CSCAs x tasks_per_CSCA)")
     plt.ylabel("Intent Satisfaction Rate")
-    plt.title("Fig 9a: ISR vs Number of Tasks (3 seeds, 200 ep each)")
+    plt.title("Fig 9a: ISR vs Tasks (paper methodology)")
     plt.legend()
-    plt.grid(True)
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(os.path.join(RESULTS, "fig9a_isr_vs_tasks.png"), dpi=120)
     plt.close()
 
-    rows = []
-    for i, n in enumerate(task_counts):
-        row = [n]
-        for m in ["HDM", "SAC", "AC", "PPO", "Static"]:
-            row.extend([f"{results[m]['isr'][i]:.4f}", f"{results[m]['isr_std'][i]:.4f}"])
-        rows.append(row)
-    header = ["n_tasks"]
-    for m in ["HDM", "SAC", "AC", "PPO", "Static"]:
-        header.extend([f"{m}_ISR", f"{m}_std"])
-    save_csv(os.path.join(RESULTS, "fig9a_isr_vs_tasks.csv"), rows, header)
+    save_csv(
+        os.path.join(RESULTS, "fig9a_isr_vs_tasks.csv"),
+        [[total_tasks_list[i]] + [results[m][i] for m in ["HDM", "SAC", "AC", "PPO", "Static"]]
+         for i in range(len(tasks_per_csca_list))],
+        ["total_tasks", "HDM", "SAC", "AC", "PPO", "Static"]
+    )
     log("Experiment 1 complete.")
     return results
 
@@ -352,7 +355,7 @@ def experiment_delay_vs_sinr():
             h_d, s_d = [], []
             for _ in range(200):
                 state = env.generate_state()
-                graph_emb, _ = han.encode_state(state)
+                graph_emb, _, _ = han.encode_state(state)
                 for method, fn in [("HDM", hdm), ("Static", static)]:
                     with torch.no_grad():
                         action_raw = fn(graph_emb) if method == "HDM" else static.get_action(graph_emb)
@@ -402,7 +405,8 @@ def experiment_cscqi_convergence():
         rewards = []
 
     if rewards:
-        norm_rewards = normalize_cscqi(rewards)
+        r_min, r_max = min(rewards), max(rewards)
+        norm_rewards = [(r - r_min) / max(r_max - r_min, 1e-8) for r in rewards]
         smoothed = np.convolve(norm_rewards, np.ones(50)/50, mode='valid')
 
         plt.figure(figsize=(7, 4))
@@ -423,7 +427,7 @@ def experiment_cscqi_convergence():
     log("Experiment 3 complete.")
 
 
-def experiment_ablation():
+def experiment_ablation(use_high_pressure=False):
     """Fig 13: Ablation -- HDM vs no-HAN vs no-DDPM."""
     set_seed(42)
     log("Experiment 4: Ablation (Fig 13) -- averaged over 3 seeds x 200 episodes")
@@ -435,10 +439,13 @@ def experiment_ablation():
 
     for n in task_counts:
         action_dim = n + n * 5 + n * 3
-        han_n = HANNetwork(hidden_channels=128, num_heads=8, num_layers=2,
+        han_n = HANNetwork(hidden_channels=256, num_heads=8, num_layers=3,
                            n_cscas=n, n_relays=5, n_messages=n, n_base_stations=n).to(DEVICE)
 
-        def env_fn(n=n): return MultiCSCAEnvironment(n_cscas=n, n_relays=5, difficulty="hard")
+        if use_high_pressure:
+            def env_fn(n=n): return HighPressureEnvironment(n_cscas=n, n_relays=5)
+        else:
+            def env_fn(n=n): return MultiCSCAEnvironment(n_cscas=n, n_relays=5, difficulty="hard")
 
         if n == 5:
             r = run_method_episodes_averaged("HDM", hdm.forward, env_fn, han,
@@ -533,7 +540,7 @@ def experiment_multimodal_semcom():
     log("Experiment 5 complete.")
 
 
-def generate_summary_table():
+def generate_summary_table(use_high_pressure=True):
     """Generate results_summary.csv with averaged results."""
     set_seed(42)
     log("Generating summary table (3 seeds x 200 episodes)...")
@@ -567,7 +574,7 @@ def generate_summary_table():
 
 
 
-def experiment_delay_reduction():
+def experiment_delay_reduction(use_high_pressure=True):
     """
     Measures delay reduction: HDM vs baselines across task counts and SINR.
     Paper claims -33.40% delay reduction (Fig 9c, 9d).
@@ -579,25 +586,37 @@ def experiment_delay_reduction():
     n_episodes = 100
     delay_results = {m: [] for m in ["HDM", "SAC", "PPO", "AC", "Static"]}
 
+    if use_high_pressure:
+        env = HighPressureEnvironment(n_cscas=5, n_relays=5)
+    else:
+        env = MultiCSCAEnvironment(n_cscas=5, n_relays=5, difficulty="hard")
+
+    han_t, hdm_t = load_trained_hdm(n_tasks=5)
+    sac_a = load_trained_baseline("SAC", 45)
+    ppo_a = load_trained_baseline("PPO", 45)
+    ac_a = load_trained_baseline("AC", 45)
+
     for n in task_counts:
-        env = MultiCSCAEnvironment(n_cscas=n, n_relays=5)
-        action_dim = n + n * 5 + n * 3
+        # HDM
+        hdm_delays = []
+        for ep in range(n_episodes):
+            state = env.generate_state()
+            graph_emb, _, msg_embs = han_t.encode_state(state)
+            with torch.no_grad():
+                action_raw = hdm_t(graph_emb, message_embs=msg_embs)
+            parsed = parse_action(action_raw, 5, 5, 3)
+            result = env.step(parsed, state)
+            hdm_delays.append(np.mean([t["tau_S"] for t in result["tasks"]]))
+        delay_results["HDM"].append(np.mean(hdm_delays))
 
-        han_t, hdm_t = load_trained_hdm(n_tasks=n)
-        sac_a = load_trained_baseline("SAC", 45)
-        ppo_a = load_trained_baseline("PPO", 45)
-        ac_a = load_trained_baseline("AC", 45)
-
-        methods = {"HDM": hdm_t, "SAC": sac_a, "PPO": ppo_a, "AC": ac_a}
-
-        for name, model in methods.items():
+        # Baselines
+        for name, model in [("SAC", sac_a), ("PPO", ppo_a), ("AC", ac_a)]:
             delays = []
             for ep in range(n_episodes):
                 state = env.generate_state()
-                graph_emb, _ = han_t.encode_state(state)
-                with torch.no_grad():
-                    action_raw = model(graph_emb)
-                parsed = parse_action(action_raw, n, 5, 3)
+                graph_emb, _, _ = han_t.encode_state(state)
+                action_raw = model.get_action(graph_emb)
+                parsed = parse_action(action_raw, 5, 5, 3)
                 result = env.step(parsed, state)
                 delays.append(np.mean([t["tau_S"] for t in result["tasks"]]))
             delay_results[name].append(np.mean(delays))
@@ -606,9 +625,8 @@ def experiment_delay_reduction():
         delays_s = []
         for ep in range(n_episodes):
             state = env.generate_state()
-            graph_emb, _ = han_t.encode_state(state)
             action_raw = torch.ones(1, 45, device=DEVICE) * 0.5
-            parsed = parse_action(action_raw, n, 5, 3)
+            parsed = parse_action(action_raw, 5, 5, 3)
             result = env.step(parsed, state)
             delays_s.append(np.mean([t["tau_S"] for t in result["tasks"]]))
         delay_results["Static"].append(np.mean(delays_s))
@@ -653,7 +671,7 @@ def experiment_delay_reduction():
         d_hdm, d_st = [], []
         for ep in range(n_episodes_snr):
             state = env5.generate_state()
-            graph_emb, _ = han5.encode_state(state)
+            graph_emb, _, _ = han5.encode_state(state)
             for dl, fn in [(d_hdm, hdm5), (d_st, lambda g: torch.ones(1, 45, device=DEVICE) * 0.5)]:
                 with torch.no_grad():
                     action_raw = fn(graph_emb)
@@ -688,119 +706,114 @@ def experiment_delay_reduction():
 
 def experiment_scale_comparison():
     """
-    ISR vs tasks at n=5, n=10, n=15 CSCA nodes.
-    This is the paper's key result showing HDM advantage grows with scale.
-    Matches paper Fig 10 (if it exists) or extends Fig 9a.
+    Scale comparison following paper methodology.
+    Paper: 5 CSCAs fixed, tasks_per_csca varies 2-20.
+    Model trained at n_cscas=5 only.
     """
+    log("Experiment: Scale comparison (paper methodology)")
     set_seed(42)
-    log("Experiment: Scale comparison n=5, n=10, n=15")
 
-    task_counts = [2, 5, 8, 10, 12, 15, 18, 20]
-    results_by_scale = {}
+    tasks_per_csca_list = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+    n_cscas = 5
+    n_episodes = 50
 
-    for n_cscas in [5, 10, 15]:
-        log(f"  Running n_cscas={n_cscas}...")
-        results_by_scale[n_cscas] = {}
+    han_trained, hdm_trained = load_trained_hdm(n_tasks=5, n_relays=5, device=DEVICE)
+    sac_actor = load_trained_baseline("SAC", 45, DEVICE)
 
-        han_trained, hdm_trained = load_trained_hdm(
-            n_tasks=n_cscas, n_relays=5, device=DEVICE
-        )
+    results = {"HDM": [], "SAC": [], "Static": []}
 
-        for n_tasks in task_counts:
-            if n_tasks > n_cscas * 4:
-                continue  # Skip unreasonable task counts
+    for tasks_per_csca in tasks_per_csca_list:
+        env = HighPressureEnvironment(n_cscas=n_cscas, n_relays=5)
+        ep_isrs = {m: [] for m in results}
 
-            action_dim = n_tasks + n_tasks * 5 + n_tasks * 3
-            env = MultiCSCAEnvironment(n_cscas=n_tasks, n_relays=5)
+        for ep in range(n_episodes):
+            for _ in range(tasks_per_csca):
+                state = env.generate_state()
+                graph_emb, _, msg_embs = han_trained.encode_state(state)
 
-            han_n = HANNetwork(hidden_channels=128, num_heads=8, num_layers=2,
-                               n_cscas=n_tasks, n_relays=5, n_messages=n_tasks,
-                               n_base_stations=n_tasks).to(DEVICE)
+                with torch.no_grad():
+                    hdm_action = hdm_trained(graph_emb, message_embs=msg_embs)
+                bw = hdm_action[:, :5]
+                relay = hdm_action[:, 5:30].reshape(1, 5, 5)
+                mcs = hdm_action[:, 30:].reshape(1, 5, 3)
+                result = env.step({"bandwidth": bw, "relay": relay, "mcs": mcs}, state)
+                ep_isrs["HDM"].append(compute_isr(result["tasks"]))
 
-            # HDM: use trained at n=5 for n=5, untrained for others
-            if n_cscas == 5 and n_tasks == 5:
-                hdm_fn = hdm_trained.forward
-                hdm_han = han_trained
-            else:
-                hdm_n = HDMPolicy(action_dim=action_dim).to(DEVICE)
-                hdm_fn = hdm_n.forward
-                hdm_han = han_n
+                sac_action = sac_actor.get_action(graph_emb)
+                bw = sac_action[:, :5]
+                relay = sac_action[:, 5:30].reshape(1, 5, 5)
+                mcs = sac_action[:, 30:].reshape(1, 5, 3)
+                result = env.step({"bandwidth": bw, "relay": relay, "mcs": mcs}, state)
+                ep_isrs["SAC"].append(compute_isr(result["tasks"]))
 
-            sac_n = load_trained_baseline("SAC", 45, DEVICE)
-            static_n = StaticBaseline(action_dim=action_dim, device=DEVICE)
+                static_action = torch.ones(1, 45, device=DEVICE) * 0.5
+                result = env.step({"bandwidth": static_action[:, :5], "relay": static_action[:, 5:30].reshape(1, 5, 5), "mcs": static_action[:, 30:].reshape(1, 5, 3)}, state)
+                ep_isrs["Static"].append(compute_isr(result["tasks"]))
 
-            method_results = {}
-            for name, model_han, fn in [
-                ("HDM", hdm_han, hdm_fn),
-                ("SAC", han_n, sac_n.get_action),
-                ("Static", han_n, static_n.get_action),
-            ]:
-                r = run_method_episodes_averaged(
-                    name, fn, lambda e=env: e, model_han,
-                    n_episodes=100, n_seeds=3, n_tasks=n_tasks
-                )
-                method_results[name] = r["isr"]
+        for m in results:
+            results[m].append(float(np.mean(ep_isrs[m])))
+        log(f"    tasks_per_csca={tasks_per_csca} (total={tasks_per_csca*5}): " + 
+            ", ".join(f"{m}={results[m][-1]:.3f}" for m in results))
 
-            results_by_scale[n_cscas][n_tasks] = method_results
-            log(f"    n_tasks={n_tasks}: HDM={method_results['HDM']:.3f}, "
-                f"SAC={method_results['SAC']:.3f}, Static={method_results['Static']:.3f}")
-
-    # Plot
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    for idx, n_cscas in enumerate([5, 10, 15]):
-        ax = axes[idx]
-        data = results_by_scale[n_cscas]
-        task_ns = sorted(data.keys())
-        for method, color in [("HDM", "b"), ("SAC", "r"), ("Static", "k")]:
-            isr_vals = [data[n][method] for n in task_ns]
-            ax.plot(task_ns, isr_vals, f"{color}-o", label=method, markersize=5)
-        ax.set_xlabel("Number of Tasks")
-        ax.set_ylabel("ISR")
-        ax.set_title(f"n_cscas={n_cscas}")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-
-    plt.suptitle("Scale Comparison: HDM vs Baselines")
+    total_tasks = [t * 5 for t in tasks_per_csca_list]
+    plt.figure(figsize=(8, 5))
+    for m, style in [("HDM", "b-o"), ("SAC", "r-s"), ("Static", "k--x")]:
+        plt.plot(total_tasks, results[m], style, label=m, markersize=5)
+    plt.xlabel("Total Tasks (5 CSCAs x tasks_per_CSCA)")
+    plt.ylabel("ISR")
+    plt.title("Scale Comparison: HDM vs Baselines")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    out_path = os.path.join(RESULTS, "scale_comparison_n5_n10_n15.png")
-    plt.savefig(out_path, dpi=120)
+    plt.savefig(os.path.join(RESULTS, "scale_comparison_n5_n10_n15.png"), dpi=120)
     plt.close()
-    log(f"Scale comparison saved: {out_path}")
 
-    # Save CSV
-    rows = []
-    for n_cscas in [5, 10, 15]:
-        data = results_by_scale[n_cscas]
-        for n_tasks in sorted(data.keys()):
-            row = [n_cscas, n_tasks]
-            for method in ["HDM", "SAC", "Static"]:
-                row.append(data[n_tasks].get(method, "N/A"))
-            rows.append(row)
     save_csv(
         os.path.join(RESULTS, "scale_comparison.csv"),
-        rows,
-        ["n_cscas", "n_tasks", "HDM", "SAC", "Static"]
+        [[total_tasks[i], results["HDM"][i], results["SAC"][i], results["Static"][i]]
+         for i in range(len(tasks_per_csca_list))],
+        ["total_tasks", "HDM", "SAC", "Static"]
     )
-    log("Experiment scale comparison complete.")
-    return results_by_scale
+    log("Scale comparison complete.")
+    return results
 
 
 if __name__ == "__main__":
+    import sys as _sys
     set_seed(42)
 
-    log("=" * 60)
-    log("CSCA FINAL EXPERIMENT SUITE")
-    log("Using trained HDM and baseline checkpoints")
-    log("=" * 60)
+    if len(_sys.argv) > 1 and _sys.argv[1] == "--scale-only":
+        log("=" * 60)
+        log("SCALE COMPARISON ONLY")
+        log("=" * 60)
+        experiment_scale_comparison()
+        log("Scale comparison complete.")
 
-    experiment_isr_vs_tasks()
-    experiment_delay_vs_sinr()
-    experiment_cscqi_convergence()
-    experiment_ablation()
-    experiment_scale_comparison()
-    generate_summary_table()
+    elif len(_sys.argv) > 1 and _sys.argv[1] == "--high-pressure":
+        log("=" * 60)
+        log("HIGH-PRESSURE evaluation suite")
+        log("=" * 60)
+        experiment_isr_vs_tasks(use_high_pressure=True)
+        experiment_delay_reduction(use_high_pressure=True)
+        experiment_scale_comparison()
+        generate_summary_table(use_high_pressure=True)
+        log("=" * 60)
+        log("HIGH-PRESSURE EXPERIMENTS COMPLETE")
+        log(f"Results saved to: {RESULTS}")
+        log("=" * 60)
 
-    log("=" * 60)
-    log("ALL EXPERIMENTS COMPLETE")
-    log(f"Results saved to: {RESULTS}")
-    log("=" * 60)
+    else:
+        log("=" * 60)
+        log("STANDARD evaluation suite")
+        log("=" * 60)
+        experiment_isr_vs_tasks(use_high_pressure=False)
+        experiment_delay_vs_sinr()
+        experiment_cscqi_convergence()
+        experiment_ablation()
+        experiment_scale_comparison()
+        experiment_delay_reduction(use_high_pressure=False)
+        generate_summary_table(use_high_pressure=False)
+        log("=" * 60)
+        log("ALL EXPERIMENTS COMPLETE")
+        log(f"Results saved to: {RESULTS}")
+        log("=" * 60)

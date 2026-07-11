@@ -1,0 +1,293 @@
+================================================================================
+FAILURE RESEARCH REPORT — CSCA Mini Project 2
+Date: 2026-07-10
+================================================================================
+
+TASK 1 — WHY IS DDPM ACTOR LOSS DIVERGING?
+================================================================================
+
+ROOT CAUSE IDENTIFIED:
+
+Our implementation computes:
+  log_pi = -tanh(MSE(noise, predicted_noise) / 10)
+  actor_loss = -(log_pi * advantage)
+
+This is WRONG. The correct approach from DDPO (Black et al. 2023, arXiv:2305.13301):
+
+DDPO treats denoising as a multi-step MDP where:
+  - State: s_t = (condition, t, x_t)
+  - Action: a_t = x_{t-1} (the denoised sample)
+  - Policy: pi(a_t|s_t) = p_theta(x_{t-1} | x_t, c) — an isotropic Gaussian
+  - Reward: r(x_0, c) only at final step t=0
+
+The exact log-likelihood for each denoising step is:
+  log p_theta(x_{t-1} | x_t, c) = -1/(2*sigma_t^2) * ||x_{t-1} - mu_theta(x_t, t, c)||^2
+
+This is NOT the noise prediction MSE. It's the RECONSTRUCTION error at each step,
+weighted by the inverse variance of the posterior.
+
+The DDPO gradient is:
+  nabla_theta J = E[sum_{t=0}^{T} nabla_theta log p_theta(x_{t-1}|x_t, c) * r(x_0, c)]
+
+Key insight: the reward r is the SAME for all denoising steps in a trajectory.
+Only the log-probabilities change per step.
+
+WHAT WE'RE DOING WRONG:
+1. We compute log_pi from noise prediction MSE, not reconstruction log-likelihood
+2. We apply reward weighting to a SINGLE denoising step, not all T steps
+3. We use tanh normalization which destroys the gradient signal
+4. Advantage should be computed from the full trajectory return, not single-step
+
+CORRECT IMPLEMENTATION (from DDPO paper):
+```python
+# For each denoising step t in trajectory:
+# 1. Compute mu_theta = predicted clean sample from x_t
+# 2. Compute log_prob = -||x_{t-1} - mu_theta||^2 / (2 * beta_t)
+# 3. Sum log_probs across all steps = total log_prob for trajectory
+# 4. actor_loss = -total_log_prob * reward  (REINFORCE)
+# Or with importance sampling ratio for multiple optimization steps (DDPO-IS)
+
+# DDPO-SF (score function / REINFORCE):
+loss = sum(log_prob_t for t in range(T)) * reward
+
+# DDPO-IS (importance sampling, like PPO):
+ratio = prod(new_prob_t / old_prob_t for t in range(T))
+loss = ratio * reward
+# With PPO clipping on the ratio
+```
+
+REFERENCE IMPLEMENTATION:
+https://github.com/jannerm/ddpo
+Tested on Google Cloud TPUs. Not tested on GPU.
+
+RELATED PAPERS:
+- DPPO (Diffusion Policy Policy Optimization): arxiv.org/abs/2409.00588
+  - Best practices for fine-tuning diffusion policies in continuous control
+  - Uses multiple denoising steps per gradient update
+  - Key: clip the probability ratio across ALL denoising steps
+- TDPO-R: Temporal Diffusion Policy Optimization with critic Reset
+  - github.com/ZiyiZhang27/tdpo
+  - Addresses reward overoptimization in diffusion RL
+  - Key: dormant neurons regularize against overoptimization
+
+RECOMMENDED FIX:
+Replace our custom Eq. 33 implementation with DDPO-IS (importance sampling):
+1. Collect full denoising trajectories (all N steps)
+2. Compute log_prob for each step using Gaussian likelihood
+3. Compute importance ratio = new_log_prob / old_log_prob
+4. Apply PPO clipping to the ratio
+5. Multiply by advantage (normalized)
+
+This is fundamentally different from what we're doing. Our current approach
+computes noise MSE at a SINGLE midpoint step and multiplies by advantage.
+DDPO uses the FULL trajectory likelihood with importance sampling.
+
+================================================================================
+
+TASK 2 — ALTERNATIVE CHANNEL MODELS
+================================================================================
+
+1. DeepMIMO (deepmimo.net)
+   - Python package, pip installable
+   - Implements 3GPP TR 38.901 channel model
+   - Supports mmWave, massive MIMO
+   - RTX 4050 compatible (numpy-based, not GPU-dependent)
+   - VRAM: minimal (channel computation is CPU)
+   - VERIFIED: Used in 100+ papers
+   - pip install DeepMIMO
+
+2. Sionna (sionna.org)
+   - NVIDIA's link-level simulation library
+   - pip install sionna
+   - Full 5G NR channel models
+   - GPU-accelerated (uses TensorFlow)
+   - RTX 4050: works but may need TF-GPU setup
+   - VRAM: 2-4GB for channel sim
+   - VERIFIED: Used by NVIDIA, open source
+
+3. QuaDRiGa (quadriga-channel-model.de)
+   - 3GPP compliant channel model
+   - MATLAB-based, no Python wrapper found
+   - NOT viable for our setup
+
+4. DeepSC's channel (what we already use)
+   - Simple AWGN/Rayleigh/Rician
+   - Already integrated
+   - Missing: mmWave path loss, beamforming, MIMO
+
+RECOMMENDATION: DeepMIMO is the most viable upgrade.
+It implements 3GPP TR 38.901, is pip installable, runs on CPU,
+and doesn't require GPU. It would give us realistic mmWave channel
+gains without the complexity of Sionna's TensorFlow dependency.
+
+However, the channel model is NOT the primary cause of our low ISR.
+The primary cause is the actor loss formulation (Task 1).
+
+================================================================================
+
+TASK 3 — COMPRESSION RATIO: 0.93 vs 0.73
+================================================================================
+
+DeepSC compression ratio definition (Xie et al. 2021, IEEE TSP):
+  "The number of transmitted symbols per word"
+  rho = k / L_s
+  where k = number of complex channel symbols transmitted
+        L_s = number of words in the sentence
+
+In our DeepSC model:
+  - Semantic encoder output: [batch, seq_len, d_model] = [1, L, 128]
+  - Channel encoder output: [batch, seq_len, 16] = [1, L, 16]
+  - Each word maps to 16 channel symbols
+  - rho = 16 / 1 = 16 symbols per word
+
+Wait — that's 16x EXPANSION, not compression!
+
+Looking at the DeepSC paper more carefully:
+  "Fig. 8 illustrates the impact of the number of symbols per word
+   on the 1-gram BLEU score when SNR is 12 dB."
+
+The paper tests different symbols-per-word ratios (4, 8, 16, 32).
+With 16 symbols/word at SNR=12dB, BLEU ≈ 0.8.
+
+The compression ratio in the Sun et al. 2026 paper (our reference):
+  "CSCA achieves compression ratios of 73.3%, 32.2%, and 21.3%
+   on text, audio, and image modalities respectively"
+
+This is NOT DeepSC's compression ratio. This is MSS (Minimum Synonymous
+Subsequence) compression: the ratio of simplified text length to original.
+
+So the paper's 73% text compression comes from MSS with eta=0.85,
+NOT from DeepSC's channel encoding. Our MSS achieves 93% because:
+- Our eta=0.85 is too permissive (keeps more words)
+- The paper's MSS may use a lower eta threshold
+- Or the paper's LAM generates shorter descriptions than our SST sentences
+
+FIX: Lower eta in source_simplifier.py from 0.85 to 0.6-0.7.
+This would reduce compression from 0.93 to closer to 0.73.
+
+Also: the paper's compression is measured on LAM-generated descriptions
+of multimodal data, NOT on raw SST sentences. LAM descriptions are
+inherently longer and more redundant, so MSS removes more words.
+
+Our test uses SST sentences which are already concise. That's why
+MSS keeps 93% — there's less redundancy to remove.
+
+================================================================================
+
+TASK 4 — EXISTING CSCA/HDM IMPLEMENTATIONS
+================================================================================
+
+GitHub search results:
+
+1. github.com/13274086/DeepSC
+   - DeepSC original implementation by Huiqiang Xie
+   - VERIFIED: We already have this at D:\MP2\repos\DeepSC
+   - Not the CSCA paper, just the DeepSC backbone
+
+2. github.com/qiyuqianxai/Large-AI-Model-Empowered-Multimodal-Semantic-communication
+   - LAM-MSC by Jiang et al. 2025
+   - VERIFIED: We already cloned this
+   - Related but different paper
+
+3. github.com/SMRhadou/PDI-Diffusion
+   - GNN + DDPM for wireless resource allocation
+   - VERIFIED: We already cloned this
+   - HDM backbone inspiration
+
+4. No CSCA-specific implementation found
+   - Sun et al. 2026 has NO public code repository
+   - No GitHub repo by Yan Sun (BUPT) found for this paper
+   - Paper cites code availability: NOT PROVIDED
+
+5. github.com/jannerm/ddpo
+   - DDPO implementation by Black et al. 2023
+   - VERIFIED: Open source, tested on TPUs
+   - Reference for fixing our actor loss
+
+6. github.com/ZiyiZhang27/tdpo
+   - TDPO-R: Temporal Diffusion Policy Optimization
+   - VERIFIED: Addresses reward overoptimization
+   - Could help with our unstable training
+
+CONCLUSION: No CSCA implementation exists publicly.
+Our implementation is the only one. The paper's code is not available.
+
+================================================================================
+
+TASK 5 — RANKED ACTIONS BY EXPECTED IMPACT
+================================================================================
+
+1. FIX ACTOR LOSS (HIGHEST IMPACT)
+   Expected: Could improve ISR from 20% to 40-60%
+   Effort: 2-4 hours
+   What: Replace our custom Eq. 33 with DDPO-IS (importance sampling).
+   Use full denoising trajectory likelihood, not single-step noise MSE.
+   Reference: github.com/jannerm/ddpo, arXiv:2305.13301
+   Why: Our current actor loss diverges to -434 billion. DDPO's formulation
+   is mathematically correct and proven to work for diffusion RL.
+
+2. FIX COMPRESSION RATIO (MEDIUM IMPACT)
+   Expected: Compression from 0.93 to 0.70-0.75
+   Effort: 30 minutes
+   What: Lower MSS eta from 0.85 to 0.6. Also, evaluate on LAM-generated
+   descriptions instead of raw SST sentences.
+   Why: The paper measures compression on LAM outputs (longer, more redundant),
+   not raw SST sentences (already concise).
+
+3. ADD DeepMIMO CHANNEL (LOW-MEDIUM IMPACT)
+   Expected: More realistic channel, possibly 5-10% ISR improvement
+   Effort: 2-3 hours
+   What: pip install DeepMIMO, replace numpy channel with 3GPP TR 38.901
+   Why: Our simplified channel model doesn't capture mmWave propagation,
+   beamforming, or realistic interference patterns.
+
+4. FIX TASK COUNT EVALUATION (ALREADY DONE)
+   Expected: Correct comparison methodology
+   Effort: Done
+   What: 5 CSCAs fixed, 2-20 tasks per CSCA = 10-100 total
+   Why: Paper uses this methodology, we were using wrong scaling.
+
+5. TRAIN LONGER WITH DDPO (AFTER FIX 1)
+   Expected: Further ISR improvement
+   Effort: 1-2 hours
+   What: 1000-2000 episodes with corrected DDPO loss
+   Why: More training with stable loss should improve convergence.
+
+6. RETRAIN BASELINES ON SAME ENVIRONMENT (LOW IMPACT)
+   Expected: Fair comparison, 1-3% difference
+   Effort: 1-2 hours
+   What: Train SAC/PPO/AC on HighPressureEnvironment
+   Why: Current baselines were trained on standard environment.
+
+IS ANY OF THIS ACHIEVABLE WITHOUT DR. JOSHI'S HELP?
+- Fix 1 (actor loss): YES — implement DDPO from open-source reference
+- Fix 2 (compression): YES — change one parameter
+- Fix 3 (DeepMIMO): YES — pip install
+- Fix 4 (task count): DONE
+- Fix 5 (train longer): YES — after fix 1
+- Fix 6 (retrain baselines): YES — after fix 1
+
+None of these require Dr. Joshi's help. They all have open-source references
+and clear implementation paths. The biggest blocker is fix 1 (DDPO actor loss)
+which requires understanding the DDPO paper and adapting the reference code.
+
+================================================================================
+
+BOTTOM LINE
+================================================================================
+
+The SINGLE MOST IMPACTFUL change is fixing the actor loss to use DDPO-IS.
+Our current implementation (noise MSE * advantage) is mathematically wrong.
+DDPO (Black et al. 2023) provides the correct formulation and open-source
+reference code. Implementing DDPO-IS could improve ISR from 20% to 40-60%.
+
+The paper's +42% ISR claim is achievable — but only with the correct
+DDPO training algorithm, not our custom Eq. 33 approximation.
+
+Priority order:
+1. Fix actor loss (DDPO-IS)
+2. Fix compression ratio (eta=0.6)
+3. Retrain HDM with DDPO-IS (1000 episodes)
+4. Re-run experiments
+
+================================================================================

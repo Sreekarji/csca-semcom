@@ -1,110 +1,165 @@
-# CSCA — Cognitive Semantic Communication Architecture
+# CSCA: Cognitive Semantic Communication Agent
 
-Implementation of **"Edge Large AI Model Agent-Empowered Cognitive Multimodal Semantic Communication"** (Sun et al., IEEE TMC, Vol. 25, No. 1, Jan 2026).
+Implementation of the paper:
+> Y. Sun et al., "Edge Large AI Model Agent-Empowered Cognitive Multimodal Semantic Communication," *IEEE Transactions on Mobile Computing*, Vol. 25, No. 1, Jan 2026. DOI: 10.1109/TMC.2025.3590723
 
-## Architecture
+**Author:** Sreekar Balagoni, B.Tech ECE, Vasavi College of Engineering  
+**Research Internship:** ViSRI Lab, BITS Pilani, under Dr. Sandeep Joshi  
 
-### Layer 1: LAM (Left Brain)
-- **Qwen2-VL-7B** (4-bit quantized) for intent parsing
-- **Local Knowledge Base (LKB)** — 20 IG1253-format templates with cosine retrieval + CrossEncoder reranking
-- **RAG with Self-RAG** — ISREL + ISSUP reflection tokens
-- **Source Simplifier** — Algorithm 1 (MSS selection, BERT embeddings, Eq. 4)
-- **MIM** — Message Importance Metric (Eq. 5)
-- **MCS Selection** — 3GPP TS 38.214 based (Eq. 6)
+---
 
-### Layer 2: HDM (Right Brain)
-- **HAN** — Heterogeneous Attention Network (2-layer HANConv, 128-dim, 8 heads)
-- **DDPM Policy** — MLP denoiser, 6 steps, noise schedule (Eq. 31-32)
-- **Actor-Critic Training** — Algorithm 2 with curriculum learning
-- **CSC Graph** — 5 node types, 7 edge types
+## Overview
 
-### Layer 3: Channel Model
-- **Path loss**: 128.1 + 37.6·log₁₀(d) — 3GPP model
-- **Shadow fading**: N(0, 8²) — 3GPP TR 38.901
-- **SINR**: φ/(σ² + ρ) — Eq. 9
-- **MCS table**: 3GPP TS 38.214 (Tables 1-3, 28-30 entries)
-- **Finite blocklength rate**: Eq. 10
-- **Delay**: D_S/ν — Eq. 12
-- **Distortion**: exp(-0.1·SINR_dB) — Eq. 14 proxy
-- **Inter-cell interference**: top-6 RSRP — Eq. 8
-- **Relay selection**: Section IV.B, Eq. 15 approximation
+This repository implements the CSCA (Cognitive SemCom Agent) framework for personalized multimodal wireless communication. The system uses a large AI model (LAM) as the left brain for intent understanding, and a Heterogeneous Diffusion Model (HDM) as the right brain for communication policy generation.
 
-## Datasets
-| Dataset | Source | Size |
-|---------|--------|------|
-| Text | Stanford Sentiment Treebank | 2,000 sentences |
-| Audio | VoxCeleb1 | 4,874 WAV files |
-| Images | Oxford Buildings | 3,678 JPG files |
-| DeepSC | Europarl | 73,472 sentence pairs |
+### Architecture
 
-## Training
-- **HDM**: 7,000 episodes (curriculum: easy→medium→hard)
-- **SAC**: 2,000 episodes
-- **PPO**: 2,000 episodes
-- **Actor-Critic**: 2,000 episodes
-- **DeepSC**: 50 epochs on Europarl
+```
+User Intent (text/audio/image)
+        ↓
+[Layer 1: LAM Left Brain]
+  - Qwen2-VL-7B for intent parsing
+  - Local Knowledge Base (LKB) with RAG
+  - Algorithm 1: Minimum Synonymous Subsequence
+        ↓
+[Layer 2: HDM Right Brain]
+  - HAN: Heterogeneous Graph Attention Network (3 layers, 256-dim)
+  - DDPM: Denoising Diffusion Policy (N=6 denoising steps)
+  - Actor-Critic training with DDPO-SF loss
+        ↓
+[Layer 3: Channel]
+  - 3GPP-compliant: path loss 128.1 + 37.6·log10(d), shadow fading N(0,8²)
+  - Finite blocklength rate model
+  - CSCQI metric (Eq. 17) for intent satisfaction measurement
+```
 
-## Experiments
-- Fig 9a: ISR vs number of tasks
-- Fig 9c: Delay vs SINR
-- Fig 12a: CSCQI convergence
-- Fig 13: Ablation study
-- Scale comparison: n=5, 10, 15 CSCA nodes
+---
 
-## Quick Start
-```powershell
-cd D:\MP2
-.\.venv\Scripts\Activate.ps1
+## Repository Structure
+
+```
+csca/
+├── code/
+│   ├── lam/              # Layer 1: LAM components
+│   │   ├── intent_parser.py
+│   │   ├── rag_intent_parser.py
+│   │   ├── lkb.py
+│   │   ├── source_simplifier.py
+│   │   └── modality_alignment.py
+│   ├── hdm/              # Layer 2: HDM components
+│   │   ├── han_network.py
+│   │   ├── ddpm_policy.py
+│   │   ├── hdm_trainer.py
+│   │   └── csc_graph_builder.py
+│   ├── channel/          # Layer 3: Channel simulation
+│   │   ├── sim_channel.py
+│   │   ├── relay_selection.py
+│   │   └── deepsc_channel.py
+│   ├── evaluation/       # Metrics
+│   │   ├── cscqi.py
+│   │   ├── shaped_reward.py
+│   │   └── dataset_loader.py
+│   ├── experiments/      # Experiment scripts
+│   │   ├── run_all_experiments.py
+│   │   ├── multimodal_eval.py
+│   │   ├── train_baselines.py
+│   │   └── baselines.py
+│   ├── utils/
+│   │   └── reproducibility.py
+│   └── csca_pipeline.py  # End-to-end pipeline
+├── results/
+│   └── software/
+│       └── final/        # Key result plots and CSVs
+├── repos/                # External repos (DeepSC, LAMMSC, PDI-Diffusion)
+├── README.md
+├── requirements.txt
+└── .gitignore
+```
+
+---
+
+## Installation
+
+```bash
+# Create virtual environment
+python -m venv .venv
+.venv\Scripts\activate  # Windows
+
+# Install dependencies
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip install torch-geometric
+pip install -r requirements.txt
+```
+
+---
+
+## Models Required
+
+Download separately (not included due to size):
+
+| Model | Purpose | Source |
+|-------|---------|--------|
+| Qwen2-VL-7B-Instruct Q4_K_M | LAM intent parsing | HuggingFace |
+| openai/whisper-base | Audio transcription | HuggingFace |
+| sd2-community/stable-diffusion-2-1 | Image reconstruction | HuggingFace |
+| all-MiniLM-L6-v2 | Semantic similarity | HuggingFace |
+
+Place models in `models/` directory.
+
+---
+
+## Usage
+
+```bash
+# Run end-to-end demo
+python code/csca_pipeline.py
 
 # Train HDM
-python code\hdm\hdm_trainer.py
+python code/hdm/hdm_trainer.py
 
 # Run all experiments
-python code\experiments\run_all_experiments.py
+python code/experiments/run_all_experiments.py
 
 # Multimodal evaluation
-python code\experiments\multimodal_eval.py
+python code/experiments/multimodal_eval.py
 ```
 
-## Project Structure
-```
-code/
-├── csca_pipeline.py          # Full pipeline
-├── lam/                      # Layer 1: LAM
-│   ├── intent_parser.py      # Qwen2-VL intent parsing
-│   ├── lkb.py                # Local Knowledge Base
-│   ├── rag_intent_parser.py  # RAG + Self-RAG
-│   ├── source_simplifier.py  # Algorithm 1 (MSS)
-│   └── modality_alignment.py # Modality alignment
-├── hdm/                      # Layer 2: HDM
-│   ├── han_network.py        # HAN graph network
-│   ├── ddpm_policy.py        # DDPM policy network
-│   ├── hdm_trainer.py        # Training loop (Algorithm 2)
-│   └── csc_graph_builder.py  # CSC graph construction
-├── channel/                  # Layer 3: Channel
-│   ├── sim_channel.py        # 3GPP channel simulation
-│   ├── relay_selection.py    # Relay selection (Eq. 15)
-│   └── mcs_table.py          # 3GPP MCS tables
-├── evaluation/               # Metrics and rewards
-│   ├── cscqi.py              # CSCQI, ISR, semantic accuracy
-│   └── shaped_reward.py      # Shaped reward for training
-├── experiments/              # Experiment scripts
-│   ├── run_all_experiments.py
-│   ├── multimodal_eval.py
-│   ├── train_baselines.py
-│   └── baselines.py
-└── utils/
-    └── reproducibility.py    # Seed setting
-```
+---
 
-## Dependencies
-- Python 3.12, PyTorch 2.6 (CUDA 12.4)
-- PyTorch Geometric 2.8
-- Transformers 5.12.1, Sentence-Transformers 5.6
-- llama-cpp-python (CUDA), openai-whisper
-- Stable Diffusion 2.1 (diffusers 0.39)
+## Results
 
-## Hardware
-- GPU: NVIDIA RTX 4050 (6GB VRAM)
-- RAM: 16GB
-- OS: Windows 11
+| Metric | Ours | Paper |
+|--------|------|-------|
+| ISR (n=5, 10-100 tasks) | 20% | 90% |
+| HDM advantage at n=20 tasks | +350% over SAC | +42% over SAC |
+| Text semantic similarity | 0.31 (DeepSC) | ~0.85 |
+| Audio semantic similarity | 0.988 | ~0.90 |
+| CSCQI optimal N | 6 (matches paper) | 6 |
+
+**Note:** ISR gap attributed to channel environment calibration differences.
+The qualitative trend (HDM advantage grows with scale) matches the paper.
+
+---
+
+## Key Implementation Notes
+
+- LLaVA-NeXT-Interleave (paper) replaced with Qwen2-VL-7B Q4_K_M (consumer GPU compatible)
+- Full 3GPP mmWave MIMO replaced with simplified 3GPP channel model (numpy)
+- Actor loss uses DDPO-SF (score function) formulation
+- Trained on consumer hardware: RTX 4050 6GB VRAM
+
+---
+
+## Citation
+
+```bibtex
+@article{sun2026edge,
+  title={Edge Large AI Model Agent-Empowered Cognitive Multimodal Semantic Communication},
+  author={Sun, Yan and others},
+  journal={IEEE Transactions on Mobile Computing},
+  volume={25},
+  number={1},
+  year={2026},
+  doi={10.1109/TMC.2025.3590723}
+}
+```

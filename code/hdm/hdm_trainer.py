@@ -15,8 +15,8 @@ sys.path.insert(0, r"D:\MP2\code\evaluation")
 
 from ddpm_policy import HDMPolicy, CriticNetwork
 from han_network import HANNetwork
-from sim_channel import MultiCSCAEnvironment
-from cscqi import compute_cscqi
+from sim_channel import MultiCSCAEnvironment, HighPressureEnvironment
+from cscqi import compute_cscqi, compute_isr
 from shaped_reward import compute_shaped_reward
 
 LOG_PATH = r"D:\MP2\log.txt"
@@ -126,9 +126,9 @@ class HDMTrainer:
         n_relays: int = 5,
         n_mcs: int = 3,
         n_denoising_steps: int = 6,
-        lr_actor: float = 3e-4,
-        lr_critic: float = 3e-4,
-        gamma: float = 0.99,
+        lr_actor: float = 1e-3,
+        lr_critic: float = 1e-3,
+        gamma: float = 0.95,
         max_grad_norm: float = 1.0,
         device: str = None,
     ):
@@ -144,9 +144,9 @@ class HDMTrainer:
         action_dim = n_cscas + n_cscas * n_relays + n_cscas * n_mcs
 
         self.han = HANNetwork(
-            hidden_channels=128,
+            hidden_channels=256,
             num_heads=8,
-            num_layers=2,
+            num_layers=3,
             n_cscas=n_cscas,
             n_relays=n_relays,
             n_messages=n_cscas,
@@ -155,21 +155,20 @@ class HDMTrainer:
 
         self.actor = HDMPolicy(
             action_dim=action_dim,
-            graph_emb_dim=128,
+            graph_emb_dim=256,
             n_denoising_steps=n_denoising_steps,
         ).to(self.device)
 
         self.critic = CriticNetwork(
-            state_dim=128,
+            state_dim=256,
             action_dim=action_dim,
         ).to(self.device)
 
-        self.env = MultiCSCAEnvironment(
+        self.env = HighPressureEnvironment(
             n_cscas=n_cscas,
             n_relays=n_relays,
             n_base_stations=n_cscas,
             n_mcs=n_mcs,
-            difficulty="hard",
         )
 
         self.opt_actor = optim.Adam(
@@ -182,46 +181,30 @@ class HDMTrainer:
         self.scheduler_actor = SequentialLR(
             self.opt_actor,
             schedulers=[
-                LinearLR(self.opt_actor, start_factor=0.1, end_factor=1.0, total_iters=100),
-                CosineAnnealingLR(self.opt_actor, T_max=1900, eta_min=1e-5),
+                LinearLR(self.opt_actor, start_factor=0.1, end_factor=1.0, total_iters=10),
+                CosineAnnealingLR(self.opt_actor, T_max=490, eta_min=1e-5),
             ],
-            milestones=[100]
+            milestones=[10]
         )
         self.scheduler_critic = SequentialLR(
             self.opt_critic,
             schedulers=[
-                LinearLR(self.opt_critic, start_factor=0.1, end_factor=1.0, total_iters=100),
-                CosineAnnealingLR(self.opt_critic, T_max=1900, eta_min=1e-5),
+                LinearLR(self.opt_critic, start_factor=0.1, end_factor=1.0, total_iters=10),
+                CosineAnnealingLR(self.opt_critic, T_max=490, eta_min=1e-5),
             ],
-            milestones=[100]
+            milestones=[10]
         )
 
         # Experience replay
         self.replay_buffer = ReplayBuffer(capacity=10000)
-        self.batch_size = 32
+        self.batch_size = 256
         self.min_buffer_size = 64
 
         self.reward_history = []
         self.cscqi_history = []
         self.curriculum = CurriculumScheduler()
         self.current_episode = 0
-
-        # Resume from existing checkpoint if available
-        resume_ckpt = r"D:\MP2\results\software\checkpoints\hdm_ep5000.pt"
-        if not os.path.exists(resume_ckpt):
-            resume_ckpt = r"D:\MP2\results\software\checkpoints\hdm_ep500.pt"
-        if os.path.exists(resume_ckpt):
-            ckpt = torch.load(resume_ckpt, map_location=self.device, weights_only=False)
-            try:
-                self.han.load_state_dict(ckpt["han"])
-                self.actor.load_state_dict(ckpt["actor"])
-                if "critic" in ckpt:
-                    self.critic.load_state_dict(ckpt["critic"])
-                if "reward_history" in ckpt:
-                    self.reward_history = ckpt["reward_history"]
-                log(f"Resumed from checkpoint: {resume_ckpt}")
-            except Exception as e:
-                log(f"Could not resume checkpoint: {e}. Starting fresh.")
+        self.current_intent_vectors = None
 
         log(f"HDMTrainer initialized on {self.device}")
 
@@ -232,20 +215,44 @@ class HDMTrainer:
 
         # Curriculum: progressive difficulty
         self.current_episode += 1
+
+        # Generate diverse intent vectors — mix of urgent and non-urgent
+        intent_vectors = []
+        for i in range(self.n_tasks):
+            if i % 3 == 0:
+                delay_urgency = np.random.uniform(0.7, 1.0)
+                quality_req = np.random.uniform(0.3, 0.6)
+            elif i % 3 == 1:
+                delay_urgency = np.random.uniform(0.1, 0.4)
+                quality_req = np.random.uniform(0.7, 1.0)
+            else:
+                delay_urgency = np.random.uniform(0.4, 0.7)
+                quality_req = np.random.uniform(0.4, 0.7)
+            intent_vectors.append([delay_urgency, quality_req])
+        self.current_intent_vectors = intent_vectors
+
         if system_state is None:
             params = self.curriculum.get_env_params(self.current_episode)
             system_state = self.env.generate_state_with_params(params)
+
+        # Update system state to match intent vectors
+        system_state["SCt"]["delay_intents"] = [
+            max(0.1, (1.0 - iv[0]) * 5.0) for iv in intent_vectors
+        ]
+        system_state["SCt"]["quality_intents"] = [iv[1] for iv in intent_vectors]
 
         # Log phase transitions
         if self.current_episode in [1, 200, 500]:
             phase = self.curriculum.get_phase_name(self.current_episode)
             log(f"Curriculum: now in {phase}")
 
-        # Encode state
-        graph_emb, _ = self.han.encode_state(system_state)
+        # Encode state with intent vectors
+        graph_emb, node_embs, message_embs = self.han.encode_state(
+            system_state, intent_vectors=intent_vectors
+        )
 
-        # Generate action
-        action = self.actor(graph_emb)
+        # Generate action conditioned on message embeddings
+        action = self.actor(graph_emb, message_embs=message_embs)
 
         # Parse action
         bw = action[:, :self.n_tasks]
@@ -259,13 +266,20 @@ class HDMTrainer:
         channel_result = self.env.step(parsed_action, system_state)
         tasks = channel_result["tasks"]
 
-        # Compute shaped reward
-        reward_value = compute_shaped_reward(tasks)
+        # Compute pure CSCQI reward (Eq. 17) — exactly as in paper
+        cscqi_values = []
+        for t in tasks:
+            cscqi_values.append(compute_cscqi(
+                t["tau_S"], t["vartheta_S"],
+                t["tau_S_int"], t["vartheta_S_int"],
+            ))
+        reward_value = float(np.clip(np.mean(cscqi_values), -5.0, 5.0))
+        # No shaping, no bonuses — pure Eq. 17
 
         # Get next state and encode
         next_params = self.curriculum.get_env_params(self.current_episode + 1)
         next_state = self.env.generate_state_with_params(next_params)
-        next_graph_emb, _ = self.han.encode_state(next_state)
+        next_graph_emb, _, next_message_embs = self.han.encode_state(next_state)
 
         # Push to replay buffer
         self.replay_buffer.push(graph_emb, action, reward_value, next_graph_emb)
@@ -273,7 +287,7 @@ class HDMTrainer:
         # If buffer not ready, just collect experience
         if len(self.replay_buffer) < self.min_buffer_size:
             self.reward_history.append(reward_value)
-            return reward_value, 0.0, 0.0
+            return reward_value, 0.0, 0.0, compute_isr(tasks)
 
         # Sample batch from replay buffer
         batch = self.replay_buffer.sample(self.batch_size)
@@ -290,14 +304,32 @@ class HDMTrainer:
         nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
         self.opt_critic.step()
 
-        # === ACTOR UPDATE on batch ===
-        new_actions = self.actor(states)
-        value_new = self.critic(states, new_actions)
+        # === DDPO-SF ACTOR LOSS ===
+        graph_emb_new, _, message_embs_new = self.han.encode_state(
+            system_state, intent_vectors=self.current_intent_vectors
+        )
+        a_0_new, log_prob_new = self.actor.collect_trajectory(
+            graph_emb_new, message_embs=message_embs_new
+        )
 
-        # Entropy bonus for exploration
-        entropy = -(new_actions * torch.log(new_actions + 1e-8) +
-                    (1 - new_actions) * torch.log(1 - new_actions + 1e-8)).mean()
-        actor_loss = -value_new.mean() - 0.01 * entropy
+        # Compute advantage
+        value_est = self.critic(graph_emb_new.detach(), a_0_new.detach())
+        advantage = torch.tensor([[reward_value]], dtype=torch.float, device=self.device) - value_est.detach()
+
+        # Normalize advantage with running statistics
+        if not hasattr(self, 'advantage_mean'):
+            self.advantage_mean = 0.0
+            self.advantage_std = 1.0
+            self.advantage_count = 0
+        adv_val = float(advantage.item())
+        self.advantage_count += 1
+        self.advantage_mean += (adv_val - self.advantage_mean) / self.advantage_count
+        self.advantage_std = max(abs(adv_val - self.advantage_mean), 0.1)
+        advantage_norm = ((advantage - self.advantage_mean) / (self.advantage_std + 1e-8)).clamp(-5.0, 5.0)
+
+        # DDPO-SF: actor_loss = -log_prob * advantage
+        actor_loss = -(log_prob_new * advantage_norm).mean()
+        actor_loss = torch.clamp(actor_loss, -100.0, 100.0)
 
         self.opt_actor.zero_grad()
         actor_loss.backward()
@@ -310,7 +342,7 @@ class HDMTrainer:
         r = reward_value
         self.reward_history.append(r)
         self.cscqi_history.append(r)
-        return r, critic_loss.item(), actor_loss.item()
+        return r, critic_loss.item(), actor_loss.item(), compute_isr(tasks)
 
     def train_batch_episode(self, batch_size: int = 8):
         """Train on a batch of different environment states simultaneously."""
@@ -332,10 +364,31 @@ class HDMTrainer:
 
         # Collect experiences from batch_size different states
         for _ in range(batch_size):
+            # Generate diverse intent vectors
+            intent_vectors = []
+            for i in range(self.n_tasks):
+                if i % 3 == 0:
+                    du = np.random.uniform(0.7, 1.0)
+                    qr = np.random.uniform(0.3, 0.6)
+                elif i % 3 == 1:
+                    du = np.random.uniform(0.1, 0.4)
+                    qr = np.random.uniform(0.7, 1.0)
+                else:
+                    du = np.random.uniform(0.4, 0.7)
+                    qr = np.random.uniform(0.4, 0.7)
+                intent_vectors.append([du, qr])
+
             params = self.curriculum.get_env_params(self.current_episode)
             system_state = self.env.generate_state_with_params(params)
-            graph_emb, _ = self.han.encode_state(system_state)
-            action = self.actor(graph_emb)
+            system_state["SCt"]["delay_intents"] = [
+                max(0.1, (1.0 - iv[0]) * 5.0) for iv in intent_vectors
+            ]
+            system_state["SCt"]["quality_intents"] = [iv[1] for iv in intent_vectors]
+
+            graph_emb, node_embs, message_embs = self.han.encode_state(
+                system_state, intent_vectors=intent_vectors
+            )
+            action = self.actor(graph_emb, message_embs=message_embs)
 
             bw = action[:, :self.n_tasks]
             relay = action[:, self.n_tasks:self.n_tasks + self.n_tasks * self.n_relays].reshape(1, self.n_tasks, self.n_relays)
@@ -344,7 +397,12 @@ class HDMTrainer:
 
             channel_result = self.env.step(parsed_action, system_state)
             tasks = channel_result["tasks"]
-            reward_value = compute_shaped_reward(tasks)
+            cscqi_values = [
+                compute_cscqi(t["tau_S"], t["vartheta_S"],
+                              t["tau_S_int"], t["vartheta_S_int"])
+                for t in tasks
+            ]
+            reward_value = float(np.clip(np.mean(cscqi_values), -5.0, 5.0))
 
             all_rewards.append(reward_value)
             all_graph_embs.append(graph_emb)
@@ -353,7 +411,7 @@ class HDMTrainer:
             # Also push to replay buffer
             next_params = self.curriculum.get_env_params(self.current_episode + 1)
             next_state = self.env.generate_state_with_params(next_params)
-            next_graph_emb, _ = self.han.encode_state(next_state)
+            next_graph_emb, _, _ = self.han.encode_state(next_state)
             all_next_graph_embs.append(next_graph_emb)
             self.replay_buffer.push(graph_emb, action, reward_value, next_graph_emb)
 
@@ -377,12 +435,29 @@ class HDMTrainer:
         nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
         self.opt_critic.step()
 
-        # Actor update: L_pi = -E[Q(s, a)]  (approximation of Eq. 33)
-        new_actions = self.actor(graph_embs)
-        value_new = self.critic(graph_embs.detach(), new_actions)
-        entropy = -(new_actions * torch.log(new_actions + 1e-8) +
-                    (1 - new_actions) * torch.log(1 - new_actions + 1e-8)).mean()
-        actor_loss = -value_new.mean() - 0.01 * entropy
+        # === DDPO-SF ACTOR LOSS ===
+        last_graph_emb = all_graph_embs[-1]
+        last_reward = all_rewards[-1]
+
+        a_0_new, log_prob_new = self.actor.collect_trajectory(
+            last_graph_emb, message_embs=None
+        )
+
+        val_est = self.critic(last_graph_emb.detach(), a_0_new.detach())
+        advantage = torch.tensor([[last_reward]], dtype=torch.float, device=self.device) - val_est.detach()
+
+        if not hasattr(self, 'advantage_mean'):
+            self.advantage_mean = 0.0
+            self.advantage_std = 1.0
+            self.advantage_count = 0
+        adv_val = float(advantage.item())
+        self.advantage_count += 1
+        self.advantage_mean += (adv_val - self.advantage_mean) / self.advantage_count
+        self.advantage_std = max(abs(adv_val - self.advantage_mean), 0.1)
+        advantage_norm = ((advantage - self.advantage_mean) / (self.advantage_std + 1e-8)).clamp(-5.0, 5.0)
+
+        actor_loss = -(log_prob_new * advantage_norm).mean()
+        actor_loss = torch.clamp(actor_loss, -100.0, 100.0)
 
         self.opt_actor.zero_grad()
         actor_loss.backward()
@@ -395,11 +470,15 @@ class HDMTrainer:
         mean_reward = float(np.mean(all_rewards))
         self.reward_history.append(mean_reward)
 
+        # Compute ISR from the last batch's tasks
+        last_tasks = channel_result["tasks"] if 'channel_result' in dir() else []
+        isr = compute_isr(last_tasks) if last_tasks else 0.0
+
         # Step LR schedulers
         self.scheduler_actor.step()
         self.scheduler_critic.step()
 
-        return mean_reward, critic_loss.item(), actor_loss.item()
+        return mean_reward, critic_loss.item(), actor_loss.item(), isr
 
     def train(self, max_episodes: int = 500, checkpoint_every: int = 100):
         log(f"Starting HDM training for {max_episodes} episodes on {self.device}")
@@ -407,18 +486,18 @@ class HDMTrainer:
         csv_path = os.path.join(RESULTS_PATH, "reward_curve.csv")
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["episode", "reward", "critic_loss", "actor_loss"])
+            writer.writerow(["episode", "reward", "critic_loss", "actor_loss", "isr"])
 
         for ep in range(1, max_episodes + 1):
-            reward, c_loss, a_loss = self.train_batch_episode(batch_size=8)
+            reward, c_loss, a_loss, isr = self.train_batch_episode(batch_size=8)
 
             with open(csv_path, "a", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow([ep, reward, c_loss, a_loss])
+                writer.writerow([ep, reward, c_loss, a_loss, isr])
 
             if ep % 50 == 0:
                 current_lr = self.opt_actor.param_groups[0]['lr']
-                log(f"Episode {ep}/{max_episodes} | Reward: {reward:.4f} | "
+                log(f"Episode {ep}/{max_episodes} | CSCQI: {reward:.4f} | ISR: {isr:.3f} | "
                     f"Critic: {c_loss:.4f} | Actor: {a_loss:.4f} | "
                     f"LR: {current_lr:.6f} | Buffer: {len(self.replay_buffer)}")
 
@@ -438,7 +517,10 @@ class HDMTrainer:
 
 
 
+
 if __name__ == "__main__":
+    import numpy as np
+    import os
     import sys
     sys.path.insert(0, r"D:\MP2\code\utils")
     from reproducibility import set_seed
@@ -448,69 +530,38 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
     print("=" * 60)
-    print("HDM TRAINING — 2000 EPISODES (RESUME)")
+    print("HDM RETRAINING - Eq. 33 Actor Loss + Cumulative Reward")
+    print("Paper Table II: 500 episodes, batch=256, LR=0.001")
     print("=" * 60)
 
     trainer = HDMTrainer(n_denoising_steps=6)
 
-    print(f"Buffer warmup: {trainer.min_buffer_size} episodes")
-    print("Verifying actor loss is non-zero after warmup...")
-    for i in range(trainer.min_buffer_size + 3):
-        r, cl, al = trainer.train_episode()
-        if i >= trainer.min_buffer_size:
-            print(f"  ep {i+1}: reward={r:.4f}, critic={cl:.4f}, actor={al:.6f}")
-            if abs(al) < 1e-6:
-                raise ValueError(
-                    f"Actor loss is zero at episode {i+1}. "
-                    f"Fix the actor update in train_episode() before running full training."
-                )
-    print("Verification passed. Starting 2000 episode training...")
-    print("Checkpoints saved every 200 episodes to:")
-    print("  D:\\MP2\\results\\software\\checkpoints\\")
-    print("=" * 60)
+    print("Verifying Eq. 33 actor loss (5 test episodes)...")
+    for i in range(5):
+        r, cl, al, isr = trainer.train_episode()
+        print(f"  ep {i+1}: R_acc={r:.4f}, critic={cl:.4f}, actor_loss={al:.6f}")
+        if np.isnan(al) or np.isnan(r):
+            raise ValueError(f"NaN detected at episode {i+1}. Fix before training.")
+    print("Verification passed. Starting training...")
 
-    rewards = trainer.train(max_episodes=2000, checkpoint_every=200)
+    rewards = trainer.train(max_episodes=500, checkpoint_every=100)
 
-    # Plot reward curve
-    smoothed_50 = np.convolve(rewards, np.ones(50)/50, mode='valid')
-    smoothed_100 = np.convolve(rewards, np.ones(100)/100, mode='valid')
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    # Full training curve
-    axes[0].plot(rewards, alpha=0.2, linewidth=0.5, color='blue', label='Raw')
-    axes[0].plot(range(49, len(rewards)), smoothed_50, 'r-',
-                 linewidth=1.5, label='Smoothed (50-ep)', alpha=0.7)
-    axes[0].plot(range(99, len(rewards)), smoothed_100, 'g-',
-                 linewidth=2, label='Smoothed (100-ep)')
-    axes[0].set_xlabel("Episode")
-    axes[0].set_ylabel("Reward (CSCQI)")
-    axes[0].set_title("HDM Training — Full 5000 Episodes")
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-
-    # Convergence region (last 1000 episodes)
-    last_1000 = rewards[-1000:]
-    smoothed_end = np.convolve(last_1000, np.ones(50)/50, mode='valid')
-    axes[1].plot(last_1000, alpha=0.3, linewidth=0.5, color='blue', label='Raw (last 1000)')
-    axes[1].plot(range(49, 1000), smoothed_end, 'r-', linewidth=2, label='Smoothed (50-ep)')
-    axes[1].set_xlabel("Episode (last 1000 of 5000)")
-    axes[1].set_ylabel("Reward (CSCQI)")
-    axes[1].set_title("Convergence Region")
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-
+    smoothed = np.convolve(rewards, np.ones(50)/50, mode="valid")
+    plt.figure(figsize=(10, 4))
+    plt.plot(rewards, alpha=0.3, linewidth=0.5, color="blue", label="Raw")
+    plt.plot(range(49, len(rewards)), smoothed, "r-", linewidth=2, label="Smoothed")
+    plt.xlabel("Episode")
+    plt.ylabel("Cumulative Return R_acc")
+    plt.title("HDM Training - Eq. 33 Actor Loss")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(r"D:\MP2\results\software\hdm_training_5000ep.png", dpi=120)
+    plt.savefig(r"D:\MP2\results\software\hdm_eq33_training.png", dpi=120)
     plt.close()
 
-    # Print final summary
     print("=" * 60)
     print("TRAINING COMPLETE")
-    print(f"Final reward (last 100 ep avg):  {np.mean(rewards[-100:]):.4f}")
-    print(f"Final reward (last 500 ep avg):  {np.mean(rewards[-500:]):.4f}")
-    print(f"Best reward:                     {max(rewards):.4f} at episode {rewards.index(max(rewards))+1}")
-    print(f"Convergence check (last 500 std): {np.std(rewards[-500:]):.4f}")
-    print(f"  (std < 0.05 suggests convergence)")
-    print(f"Reward curve saved to: D:\\MP2\\results\\software\\hdm_training_5000ep.png")
+    print(f"Final R_acc (last 50 avg): {np.mean(rewards[-50:]):.4f}")
+    print(f"Best R_acc: {max(rewards):.4f}")
     print("=" * 60)
+

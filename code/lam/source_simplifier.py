@@ -50,10 +50,11 @@ class SourceSimplifier:
         self.model = BertModel.from_pretrained(model_name)
         self.model.eval()
         self.batch_size = batch_size
-        # Move to GPU if available — speeds up batched inference significantly
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Force CPU to avoid VRAM contention with LAM and SentenceTransformer
+        # BERT inference is fast enough on CPU for MSS algorithm
+        self.device = "cpu"
         self.model = self.model.to(self.device)
-        print(f"[SourceSimplifier] Ready on {self.device}.")
+        print(f"[SourceSimplifier] Running on CPU (VRAM reserved for LAM)")
 
     # ------------------------------------------------------------------
     # Single-text embedding (used internally and by compute_semantic_distance)
@@ -117,7 +118,7 @@ class SourceSimplifier:
     # ------------------------------------------------------------------
     # Algorithm 1: MSS selection — batched implementation
     # ------------------------------------------------------------------
-    def find_mss(self, text: str, eta: float = 0.85) -> dict:
+    def find_mss(self, text: str, eta: float = 0.60) -> dict:
         """
         Algorithm 1: Minimum Synonymous Subsequence Selection.
 
