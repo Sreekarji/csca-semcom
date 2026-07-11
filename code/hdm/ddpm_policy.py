@@ -137,7 +137,8 @@ class HDMPolicy(nn.Module):
                            batch_size: int = 1):
         """
         Run full denoising trajectory and collect log-probabilities.
-        DDPO-IS: log p(x_{t-1}|x_t) at each step, summed for total log_prob.
+        DDPO-SF: only final step (n=1) carries gradient for actor update.
+        Intermediate steps detached to save memory.
         """
         device = graph_emb.device
         if graph_emb.dim() == 1:
@@ -146,37 +147,45 @@ class HDMPolicy(nn.Module):
             graph_emb = graph_emb.expand(batch_size, -1)
 
         a_n = torch.randn(batch_size, self.action_dim, device=device)
-        log_probs = []
+        total_log_prob = torch.zeros(batch_size, 1, device=device)
 
         for n in range(self.N, 0, -1):
             beta_n = self.betas[n - 1]
             alpha_n = self.alphas[n - 1]
             alpha_bar_n = self.alphas_cumprod[n - 1]
 
+            # Detach intermediate inputs, keep final step in graph
+            a_input = a_n.detach() if n < self.N else a_n
+
             predicted_noise = self.denoiser(
-                a_n, n, graph_emb, message_embs=message_embs
+                a_input, n, graph_emb, message_embs=message_embs
             )
 
             coeff = beta_n / torch.sqrt(1.0 - alpha_bar_n)
-            mu_theta = (1.0 / torch.sqrt(alpha_n)) * (a_n - coeff * predicted_noise)
+            mu_theta = (1.0 / torch.sqrt(alpha_n)) * (a_input - coeff * predicted_noise)
 
             if n > 1:
+                # Intermediate step: detach to save memory
                 noise = torch.randn_like(a_n)
-                a_prev = mu_theta + torch.sqrt(beta_n) * noise
+                a_prev = mu_theta.detach() + torch.sqrt(beta_n) * noise
+                # Log prob without gradient (intermediate)
+                log_prob = -0.5 * torch.mean(
+                    (torch.randn_like(predicted_noise) - predicted_noise.detach()) ** 2,
+                    dim=-1, keepdim=True
+                )
             else:
+                # Final step: keep in computation graph for actor update
                 a_prev = mu_theta
+                # Log prob WITH gradient (final step drives actor update)
+                log_prob = -0.5 * torch.mean(
+                    (torch.randn_like(predicted_noise) - predicted_noise) ** 2,
+                    dim=-1, keepdim=True
+                )
+                total_log_prob = log_prob
 
-            # Gaussian log-likelihood: -||x_{t-1} - mu||^2 / (2*beta_n)
-            log_prob = -0.5 * torch.sum(
-                (a_prev.detach() - mu_theta) ** 2, dim=-1, keepdim=True
-            ) / (beta_n + 1e-8)
-
-            log_probs.append(log_prob)
             a_n = a_prev
 
         a_0 = torch.sigmoid(a_n)
-        total_log_prob = torch.stack(log_probs, dim=0).sum(dim=0)
-
         return a_0, total_log_prob
 
     def reverse_diffusion(self, graph_emb: torch.Tensor,
