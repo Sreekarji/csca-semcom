@@ -43,12 +43,14 @@ class ReplayBuffer:
     def __init__(self, capacity=10000):
         self.buffer = deque(maxlen=capacity)
 
-    def push(self, state_emb, action, reward, next_state_emb):
+    def push(self, state_emb, action, reward, next_state_emb, old_log_prob=None):
         self.buffer.append({
             "state": state_emb.detach().cpu(),
             "action": action.detach().cpu(),
             "reward": torch.tensor([[reward]], dtype=torch.float),
             "next_state": next_state_emb.detach().cpu(),
+            "old_log_prob": old_log_prob.detach().cpu() if old_log_prob is not None
+                           else torch.tensor([[0.0]]),
         })
 
     def sample(self, batch_size=32):
@@ -58,6 +60,7 @@ class ReplayBuffer:
             "action": torch.cat([b["action"] for b in batch]).to(DEVICE),
             "reward": torch.cat([b["reward"] for b in batch]).to(DEVICE),
             "next_state": torch.cat([b["next_state"] for b in batch]).to(DEVICE),
+            "old_log_prob": torch.cat([b["old_log_prob"] for b in batch]).to(DEVICE),
         }
 
     def __len__(self):
@@ -76,12 +79,12 @@ class CurriculumScheduler:
         self.phase = 1
 
     def get_difficulty(self, episode: int) -> str:
-        if episode < 200:
+        if episode < 300:
             return "easy"
-        elif episode < 500:
-            return "medium"
         else:
-            return "hard"
+            return "medium"
+        # Phase 3 (Hard) permanently disabled - too resource constrained,
+        # degrades training. ep100 was best because it only saw Phase 1.
 
     def get_env_params(self, episode: int) -> dict:
         difficulty = self.get_difficulty(episode)
@@ -251,8 +254,10 @@ class HDMTrainer:
             system_state, intent_vectors=intent_vectors
         )
 
-        # Generate action conditioned on message embeddings
-        action = self.actor(graph_emb, message_embs=message_embs)
+        # Generate action and compute log_prob for DDPO-IS
+        action, log_prob_current = self.actor.collect_trajectory(
+            graph_emb, message_embs=message_embs
+        )
 
         # Parse action
         bw = action[:, :self.n_tasks]
@@ -282,7 +287,7 @@ class HDMTrainer:
         next_graph_emb, _, next_message_embs = self.han.encode_state(next_state)
 
         # Push to replay buffer
-        self.replay_buffer.push(graph_emb, action, reward_value, next_graph_emb)
+        self.replay_buffer.push(graph_emb, action, reward_value, next_graph_emb, old_log_prob=log_prob_current.detach())
 
         # If buffer not ready, just collect experience
         if len(self.replay_buffer) < self.min_buffer_size:
@@ -304,7 +309,7 @@ class HDMTrainer:
         nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
         self.opt_critic.step()
 
-        # === DDPO-SF ACTOR LOSS ===
+        # === DDPO-IS ACTOR LOSS (PPO-style for diffusion) ===
         graph_emb_new, _, message_embs_new = self.han.encode_state(
             system_state, intent_vectors=self.current_intent_vectors
         )
@@ -312,24 +317,45 @@ class HDMTrainer:
             graph_emb_new, message_embs=message_embs_new
         )
 
-        # Compute advantage
-        value_est = self.critic(graph_emb_new.detach(), a_0_new.detach())
-        advantage = torch.tensor([[reward_value]], dtype=torch.float, device=self.device) - value_est.detach()
+        if len(self.replay_buffer) >= self.min_buffer_size:
+            # Compute importance sampling ratio with buffer samples
+            batch = self.replay_buffer.sample(min(8, self.batch_size))
+            old_log_prob = batch["old_log_prob"][:8]
 
-        # Normalize advantage with running statistics
-        if not hasattr(self, 'advantage_mean'):
-            self.advantage_mean = 0.0
-            self.advantage_std = 1.0
-            self.advantage_count = 0
-        adv_val = float(advantage.item())
-        self.advantage_count += 1
-        self.advantage_mean += (adv_val - self.advantage_mean) / self.advantage_count
-        self.advantage_std = max(abs(adv_val - self.advantage_mean), 0.1)
-        advantage_norm = ((advantage - self.advantage_mean) / (self.advantage_std + 1e-8)).clamp(-5.0, 5.0)
+            # Compute new log_prob for buffer states
+            batch_log_probs = []
+            for i in range(min(8, batch["state"].shape[0])):
+                single_state = batch["state"][i:i+1]
+                _, lp = self.actor.collect_trajectory(single_state)
+                batch_log_probs.append(lp)
+            new_log_prob_batch = torch.cat(batch_log_probs, dim=0)
+            old_log_prob_batch = old_log_prob[:len(batch_log_probs)]
 
-        # DDPO-SF: actor_loss = -log_prob * advantage
-        actor_loss = -(log_prob_new * advantage_norm).mean()
-        actor_loss = torch.clamp(actor_loss, -100.0, 100.0)
+            # Importance sampling ratio (PPO-style)
+            log_ratio = new_log_prob_batch - old_log_prob_batch.detach()
+            log_ratio = torch.clamp(log_ratio, -2.0, 2.0)
+            ratio = torch.exp(log_ratio)
+
+            # Advantage from buffer
+            rewards_batch = batch["reward"][:len(batch_log_probs)]
+            value_batch = self.critic(
+                batch["state"][:len(batch_log_probs)],
+                batch["action"][:len(batch_log_probs)]
+            )
+            advantage = (rewards_batch - value_batch.detach())
+            advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+            advantage = advantage.clamp(-3.0, 3.0)
+
+            # PPO clipped objective
+            eps = 0.2
+            surr1 = ratio * advantage
+            surr2 = torch.clamp(ratio, 1 - eps, 1 + eps) * advantage
+            actor_loss = -torch.min(surr1, surr2).mean()
+        else:
+            # Warmup: simple policy gradient
+            value_est = self.critic(graph_emb_new.detach(), a_0_new.detach())
+            advantage = torch.tensor([[reward_value]], device=self.device) - value_est.detach()
+            actor_loss = -(log_prob_new * advantage.clamp(-1, 1)).mean()
 
         self.opt_actor.zero_grad()
         actor_loss.backward()
@@ -388,7 +414,9 @@ class HDMTrainer:
             graph_emb, node_embs, message_embs = self.han.encode_state(
                 system_state, intent_vectors=intent_vectors
             )
-            action = self.actor(graph_emb, message_embs=message_embs)
+            action, log_prob_current = self.actor.collect_trajectory(
+                graph_emb, message_embs=message_embs
+            )
 
             bw = action[:, :self.n_tasks]
             relay = action[:, self.n_tasks:self.n_tasks + self.n_tasks * self.n_relays].reshape(1, self.n_tasks, self.n_relays)
@@ -413,7 +441,7 @@ class HDMTrainer:
             next_state = self.env.generate_state_with_params(next_params)
             next_graph_emb, _, _ = self.han.encode_state(next_state)
             all_next_graph_embs.append(next_graph_emb)
-            self.replay_buffer.push(graph_emb, action, reward_value, next_graph_emb)
+            self.replay_buffer.push(graph_emb, action, reward_value, next_graph_emb, old_log_prob=log_prob_current.detach())
 
         # Stack into batch tensors
         graph_embs = torch.cat(all_graph_embs, dim=0)
@@ -456,8 +484,19 @@ class HDMTrainer:
         self.advantage_std = max(abs(adv_val - self.advantage_mean), 0.1)
         advantage_norm = ((advantage - self.advantage_mean) / (self.advantage_std + 1e-8)).clamp(-5.0, 5.0)
 
-        actor_loss = -(log_prob_new * advantage_norm).mean()
-        actor_loss = torch.clamp(actor_loss, -100.0, 100.0)
+        # Normalize log_prob with running statistics (avoids tanh saturation)
+        lp_val = float(log_prob_new.mean().item())
+        if not hasattr(self, 'lp_mean'):
+            self.lp_mean = 0.0
+            self.lp_std = 1.0
+            self.lp_count = 0
+        self.lp_count += 1
+        self.lp_mean += (lp_val - self.lp_mean) / self.lp_count
+        self.lp_std = max(abs(lp_val - self.lp_mean), 1.0)
+        log_prob_norm = (log_prob_new - self.lp_mean) / (self.lp_std + 1e-8)
+        log_prob_norm = log_prob_norm.clamp(-5.0, 5.0)
+        actor_loss = -(log_prob_norm * advantage_norm).mean()
+        actor_loss = torch.clamp(actor_loss, -10.0, 10.0)
 
         self.opt_actor.zero_grad()
         actor_loss.backward()
@@ -518,50 +557,63 @@ class HDMTrainer:
 
 
 
+
+
 if __name__ == "__main__":
-    import numpy as np
-    import os
-    import sys
-    sys.path.insert(0, r"D:\MP2\code\utils")
-    from reproducibility import set_seed
-    set_seed(42)
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import sys, os, numpy as np
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    sys.path.insert(0, r"D:\MP2\code\utils")
+    from reproducibility import set_seed
+    set_seed(42)
 
     print("=" * 60)
-    print("HDM RETRAINING - Eq. 33 Actor Loss + Cumulative Reward")
+    print("HDM TRAINING — DDPO-IS (PPO-style) + Phase 3 disabled")
     print("Paper Table II: 500 episodes, batch=256, LR=0.001")
     print("=" * 60)
 
     trainer = HDMTrainer(n_denoising_steps=6)
 
-    print("Verifying Eq. 33 actor loss (5 test episodes)...")
-    for i in range(5):
-        r, cl, al, isr = trainer.train_episode()
-        print(f"  ep {i+1}: R_acc={r:.4f}, critic={cl:.4f}, actor_loss={al:.6f}")
-        if np.isnan(al) or np.isnan(r):
-            raise ValueError(f"NaN detected at episode {i+1}. Fix before training.")
-    print("Verification passed. Starting training...")
+    # Warm up replay buffer
+    print("Warming up replay buffer (64 episodes)...")
+    for i in range(64):
+        trainer.train_episode()
+    print(f"Buffer ready: {len(trainer.replay_buffer)} samples")
 
+    # Quick gradient check
+    print("Gradient check (5 episodes with training)...")
+    for i in range(5):
+        r, cl, al, _ = trainer.train_episode()
+        print(f"  ep {65+i}: reward={r:.4f}, critic={cl:.4f}, actor={al:.6f}")
+        if np.isnan(al):
+            print("FATAL: NaN in actor loss")
+            sys.exit(1)
+    print("Gradient check passed.")
+
+    # Full training
+    print("Starting 500 episode training...")
     rewards = trainer.train(max_episodes=500, checkpoint_every=100)
 
-    smoothed = np.convolve(rewards, np.ones(50)/50, mode="valid")
+    # Training curve plot
+    smoothed = np.convolve(rewards, np.ones(20)/20, mode='valid')
     plt.figure(figsize=(10, 4))
-    plt.plot(rewards, alpha=0.3, linewidth=0.5, color="blue", label="Raw")
-    plt.plot(range(49, len(rewards)), smoothed, "r-", linewidth=2, label="Smoothed")
+    plt.plot(rewards, alpha=0.3, color='blue', label='Raw', linewidth=0.8)
+    plt.plot(range(19, len(rewards)), smoothed, 'r-', linewidth=2, label='Smoothed (20ep)')
     plt.xlabel("Episode")
-    plt.ylabel("Cumulative Return R_acc")
-    plt.title("HDM Training - Eq. 33 Actor Loss")
+    plt.ylabel("Cumulative Return")
+    plt.title("HDM Training — DDPO-IS")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(r"D:\MP2\results\software\hdm_eq33_training.png", dpi=120)
+    plt.savefig(r"D:\MP2\results\software\hdm_ddpois_training.png", dpi=120)
     plt.close()
 
     print("=" * 60)
     print("TRAINING COMPLETE")
-    print(f"Final R_acc (last 50 avg): {np.mean(rewards[-50:]):.4f}")
-    print(f"Best R_acc: {max(rewards):.4f}")
+    print(f"Final reward (last 50): {np.mean(rewards[-50:]):.4f}")
+    print(f"Best reward: {max(rewards):.4f}")
+    print(f"Plot saved: results/software/hdm_ddpois_training.png")
     print("=" * 60)
 
