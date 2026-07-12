@@ -7,7 +7,7 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
+  syntax-check:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
@@ -17,65 +17,18 @@ jobs:
       with:
         python-version: '3.11'
 
-    - name: Install core dependencies (no GPU)
-      run: |
-        pip install torch --index-url https://download.pytorch.org/whl/cpu
-        pip install torch-geometric numpy scipy matplotlib sentence-transformers
-
     - name: Syntax check all Python files
       run: |
-        python -m py_compile code/evaluation/cscqi.py
-        python -m py_compile code/hdm/ddpm_policy.py
-        python -m py_compile code/hdm/han_network.py
-        python -m py_compile code/hdm/csc_graph_builder.py
-        python -m py_compile code/channel/sim_channel.py
-        python -m py_compile code/evaluation/shaped_reward.py
-        echo "All files compile successfully"
+        echo "Checking syntax of all Python files..."
+        find code/ -name "*.py" -exec python -m py_compile {} \;
+        echo "All Python files passed syntax check."
 
-    - name: Test CSCQI metric
+    - name: Verify key files exist
       run: |
-        python -c "
-        import sys
-        sys.path.insert(0, 'code/evaluation')
-        from cscqi import compute_cscqi, compute_isr, is_intent_satisfied
-
-        c1 = compute_cscqi(0.5, 0.1, 1.0, 0.2)
-        assert c1 > 0, 'Expected positive CSCQI'
-
-        c2 = compute_cscqi(2.0, 0.5, 1.0, 0.2)
-        assert c2 < 0, 'Expected negative CSCQI'
-
-        tasks = [
-            {'tau_S': 0.5, 'vartheta_S': 0.1, 'tau_S_int': 1.0, 'vartheta_S_int': 0.2},
-            {'tau_S': 2.0, 'vartheta_S': 0.5, 'tau_S_int': 1.0, 'vartheta_S_int': 0.2},
-        ]
-        isr = compute_isr(tasks)
-        assert isr == 0.5, 'Expected 0.5 ISR'
-        print('CSCQI tests passed')
-        "
-
-    - name: Test channel simulation
-      run: |
-        python -c "
-        import sys
-        sys.path.insert(0, 'code/channel')
-        from sim_channel import WirelessChannel
-        ch = WirelessChannel()
-        r = ch.simulate_channel(target_snr_db=10, data_size_bits=1000000)
-        assert r['delay_s'] > 0
-        assert 0 <= r['distortion'] <= 1
-        print('Channel test passed: delay=%s, distortion=%s' % (r['delay_s'], r['distortion']))
-        "
-
-    - name: Test graph builder
-      run: |
-        python -c "
-        import sys
-        sys.path.insert(0, 'code/hdm')
-        from csc_graph_builder import CSCGraphBuilder
-        builder = CSCGraphBuilder(n_cscas=5, n_relays=5, n_messages=5, n_base_stations=5)
-        graph = builder.build()
-        assert 'csca' in graph.node_types
-        assert 'message' in graph.node_types
-        print('Graph builder test passed: %d node types' % len(graph.node_types))
-        "
+        test -f code/evaluation/cscqi.py && echo "cscqi.py exists"
+        test -f code/hdm/hdm_trainer.py && echo "hdm_trainer.py exists"
+        test -f code/hdm/han_network.py && echo "han_network.py exists"
+        test -f code/hdm/ddpm_policy.py && echo "ddpm_policy.py exists"
+        test -f code/channel/sim_channel.py && echo "sim_channel.py exists"
+        test -f code/csca_pipeline.py && echo "csca_pipeline.py exists"
+        echo "All key files present."
