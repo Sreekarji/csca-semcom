@@ -208,6 +208,8 @@ class HDMTrainer:
         self.curriculum = CurriculumScheduler()
         self.current_episode = 0
         self.current_intent_vectors = None
+        self.best_isr = 0.0
+        self.last_isr = 0.0
 
         log(f"HDMTrainer initialized on {self.device}")
 
@@ -254,10 +256,8 @@ class HDMTrainer:
             system_state, intent_vectors=intent_vectors
         )
 
-        # Generate action and compute log_prob for DDPO-IS
-        action, log_prob_current = self.actor.collect_trajectory(
-            graph_emb, message_embs=message_embs
-        )
+        # Generate action
+        action = self.actor(graph_emb, message_embs=message_embs)
 
         # Parse action
         bw = action[:, :self.n_tasks]
@@ -287,7 +287,7 @@ class HDMTrainer:
         next_graph_emb, _, next_message_embs = self.han.encode_state(next_state)
 
         # Push to replay buffer
-        self.replay_buffer.push(graph_emb, action, reward_value, next_graph_emb, old_log_prob=log_prob_current.detach())
+        self.replay_buffer.push(graph_emb, action, reward_value, next_graph_emb)
 
         # If buffer not ready, just collect experience
         if len(self.replay_buffer) < self.min_buffer_size:
@@ -309,53 +309,13 @@ class HDMTrainer:
         nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
         self.opt_critic.step()
 
-        # === DDPO-IS ACTOR LOSS (PPO-style for diffusion) ===
+        # === ACTOR UPDATE — DDPG style: maximize Q(s,a) ===
         graph_emb_new, _, message_embs_new = self.han.encode_state(
             system_state, intent_vectors=self.current_intent_vectors
         )
-        a_0_new, log_prob_new = self.actor.collect_trajectory(
-            graph_emb_new, message_embs=message_embs_new
-        )
-
-        if len(self.replay_buffer) >= self.min_buffer_size:
-            # Compute importance sampling ratio with buffer samples
-            batch = self.replay_buffer.sample(min(8, self.batch_size))
-            old_log_prob = batch["old_log_prob"][:8]
-
-            # Compute new log_prob for buffer states
-            batch_log_probs = []
-            for i in range(min(8, batch["state"].shape[0])):
-                single_state = batch["state"][i:i+1]
-                _, lp = self.actor.collect_trajectory(single_state)
-                batch_log_probs.append(lp)
-            new_log_prob_batch = torch.cat(batch_log_probs, dim=0)
-            old_log_prob_batch = old_log_prob[:len(batch_log_probs)]
-
-            # Importance sampling ratio (PPO-style)
-            log_ratio = new_log_prob_batch - old_log_prob_batch.detach()
-            log_ratio = torch.clamp(log_ratio, -2.0, 2.0)
-            ratio = torch.exp(log_ratio)
-
-            # Advantage from buffer
-            rewards_batch = batch["reward"][:len(batch_log_probs)]
-            value_batch = self.critic(
-                batch["state"][:len(batch_log_probs)],
-                batch["action"][:len(batch_log_probs)]
-            )
-            advantage = (rewards_batch - value_batch.detach())
-            advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-            advantage = advantage.clamp(-3.0, 3.0)
-
-            # PPO clipped objective
-            eps = 0.2
-            surr1 = ratio * advantage
-            surr2 = torch.clamp(ratio, 1 - eps, 1 + eps) * advantage
-            actor_loss = -torch.min(surr1, surr2).mean()
-        else:
-            # Warmup: simple policy gradient
-            value_est = self.critic(graph_emb_new.detach(), a_0_new.detach())
-            advantage = torch.tensor([[reward_value]], device=self.device) - value_est.detach()
-            actor_loss = -(log_prob_new * advantage.clamp(-1, 1)).mean()
+        action_new = self.actor(graph_emb_new, message_embs=message_embs_new)
+        q_value = self.critic(graph_emb_new.detach(), action_new)
+        actor_loss = -q_value.mean()
 
         self.opt_actor.zero_grad()
         actor_loss.backward()
@@ -414,9 +374,7 @@ class HDMTrainer:
             graph_emb, node_embs, message_embs = self.han.encode_state(
                 system_state, intent_vectors=intent_vectors
             )
-            action, log_prob_current = self.actor.collect_trajectory(
-                graph_emb, message_embs=message_embs
-            )
+            action = self.actor(graph_emb, message_embs=message_embs)
 
             bw = action[:, :self.n_tasks]
             relay = action[:, self.n_tasks:self.n_tasks + self.n_tasks * self.n_relays].reshape(1, self.n_tasks, self.n_relays)
@@ -441,7 +399,7 @@ class HDMTrainer:
             next_state = self.env.generate_state_with_params(next_params)
             next_graph_emb, _, _ = self.han.encode_state(next_state)
             all_next_graph_embs.append(next_graph_emb)
-            self.replay_buffer.push(graph_emb, action, reward_value, next_graph_emb, old_log_prob=log_prob_current.detach())
+            self.replay_buffer.push(graph_emb, action, reward_value, next_graph_emb)
 
         # Stack into batch tensors
         graph_embs = torch.cat(all_graph_embs, dim=0)
@@ -463,40 +421,10 @@ class HDMTrainer:
         nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
         self.opt_critic.step()
 
-        # === DDPO-SF ACTOR LOSS ===
-        last_graph_emb = all_graph_embs[-1]
-        last_reward = all_rewards[-1]
-
-        a_0_new, log_prob_new = self.actor.collect_trajectory(
-            last_graph_emb, message_embs=None
-        )
-
-        val_est = self.critic(last_graph_emb.detach(), a_0_new.detach())
-        advantage = torch.tensor([[last_reward]], dtype=torch.float, device=self.device) - val_est.detach()
-
-        if not hasattr(self, 'advantage_mean'):
-            self.advantage_mean = 0.0
-            self.advantage_std = 1.0
-            self.advantage_count = 0
-        adv_val = float(advantage.item())
-        self.advantage_count += 1
-        self.advantage_mean += (adv_val - self.advantage_mean) / self.advantage_count
-        self.advantage_std = max(abs(adv_val - self.advantage_mean), 0.1)
-        advantage_norm = ((advantage - self.advantage_mean) / (self.advantage_std + 1e-8)).clamp(-5.0, 5.0)
-
-        # Normalize log_prob with running statistics (avoids tanh saturation)
-        lp_val = float(log_prob_new.mean().item())
-        if not hasattr(self, 'lp_mean'):
-            self.lp_mean = 0.0
-            self.lp_std = 1.0
-            self.lp_count = 0
-        self.lp_count += 1
-        self.lp_mean += (lp_val - self.lp_mean) / self.lp_count
-        self.lp_std = max(abs(lp_val - self.lp_mean), 1.0)
-        log_prob_norm = (log_prob_new - self.lp_mean) / (self.lp_std + 1e-8)
-        log_prob_norm = log_prob_norm.clamp(-5.0, 5.0)
-        actor_loss = -(log_prob_norm * advantage_norm).mean()
-        actor_loss = torch.clamp(actor_loss, -10.0, 10.0)
+        # === ACTOR UPDATE — DDPG style: maximize Q(s,a) ===
+        action_new = self.actor(graph_embs, message_embs=None)
+        q_value = self.critic(graph_embs.detach(), action_new)
+        actor_loss = -q_value.mean()
 
         self.opt_actor.zero_grad()
         actor_loss.backward()
@@ -540,7 +468,7 @@ class HDMTrainer:
                     f"Critic: {c_loss:.4f} | Actor: {a_loss:.4f} | "
                     f"LR: {current_lr:.6f} | Buffer: {len(self.replay_buffer)}")
 
-            if ep % checkpoint_every == 0:
+            if ep % 50 == 0:
                 ckpt = os.path.join(CHECKPOINT_PATH, f"hdm_ep{ep}.pt")
                 torch.save({
                     "episode": ep,
@@ -550,6 +478,20 @@ class HDMTrainer:
                     "reward_history": self.reward_history,
                 }, ckpt)
                 log(f"Checkpoint saved: {ckpt}")
+
+                # Save best checkpoint by ISR
+                self.last_isr = isr
+                if isr > self.best_isr:
+                    self.best_isr = isr
+                    best_path = os.path.join(CHECKPOINT_PATH, "hdm_best.pt")
+                    torch.save({
+                        "episode": ep,
+                        "han": self.han.state_dict(),
+                        "actor": self.actor.state_dict(),
+                        "critic": self.critic.state_dict(),
+                        "isr": isr,
+                    }, best_path)
+                    log(f"New best checkpoint: ep{ep}, ISR={isr:.3f}")
 
         log(f"Training complete. Final reward: {self.reward_history[-1]:.4f}")
         return self.reward_history

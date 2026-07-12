@@ -88,8 +88,13 @@ def load_trained_hdm(n_tasks=5, n_relays=5, device=DEVICE):
         n_denoising_steps=6,
     ).to(device)
 
-    # Only load today's 256-dim checkpoint — skip old 128-dim ones
+    # Load best available checkpoint
     ckpt_candidates = [
+        os.path.join(CKPT_DIR, "hdm_best.pt"),
+        os.path.join(CKPT_DIR, "hdm_ep100.pt"),
+        os.path.join(CKPT_DIR, "hdm_ep200.pt"),
+        os.path.join(CKPT_DIR, "hdm_ep300.pt"),
+        os.path.join(CKPT_DIR, "hdm_ep400.pt"),
         os.path.join(CKPT_DIR, "hdm_ep500.pt"),
     ]
 

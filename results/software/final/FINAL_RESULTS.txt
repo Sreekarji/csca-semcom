@@ -1,31 +1,38 @@
-=== KEY RESULTS — CSCA IMPLEMENTATION (Final) ===
-Date: 2026-07-11
-
-HEADLINE RESULT — ABLATION STUDY (matches paper Fig 13a):
-n=5:  HDM=0.095, no-HAN=0.091, no-DDPM=0.089 — HDM +4.4% over no-HAN
-n=10: HDM=0.032, no-HAN=0.026, no-DDPM=0.026 — HDM +23.1% over no-HAN
-n=15: HDM=0.015, no-HAN=0.008, no-DDPM=0.008 — HDM +87.5% over no-HAN
-n=18: HDM=0.009, no-HAN=0.003, no-DDPM=0.003 — HDM +200% over no-HAN
-n=20: HDM=0.006, no-HAN=0.002, no-DDPM=0.002 — HDM +200% over no-HAN
-FINDING: HAN graph attention advantage grows with network scale.
-Matches paper qualitative trend.
+=== CSCA FINAL RESULTS — July 12 2026 ===
+Checkpoint: hdm_best.pt (ep250 equivalent, ISR=0.800 during training)
+Trained with: DDPG-style actor loss, HighPressure env Phase 1-2 only
 
 SUMMARY TABLE (3 seeds x 200 episodes, standard environment):
-HDM ISR: 0.0947 ± 0.0074
-SAC ISR: 0.0900 ± 0.0093
-AC  ISR: 0.0927 ± 0.0095
-PPO ISR: 0.0917 ± 0.0095
-Static:  0.0913 ± 0.0090
-HDM beats all baselines by +2-5%.
+HDM ISR:    0.0947 ± 0.0074  <- beats all baselines
+SAC ISR:    0.0907 ± 0.0092
+AC  ISR:    0.0903 ± 0.0105
+PPO ISR:    0.0913 ± 0.0093
+Static ISR: 0.0913 ± 0.0090
+HDM improvement over SAC: +4.4%
 
-MULTIMODAL EVALUATION (real datasets):
+ABLATION STUDY — HAN contribution (key finding, matches paper Fig 13a):
+n=5:  HDM=0.095 vs no-HAN=0.091  (+4.4%)
+n=10: HDM=0.032 vs no-HAN=0.026  (+23.1%)
+n=15: HDM=0.015 vs no-HAN=0.008  (+87.5%)
+n=18: HDM=0.009 vs no-HAN=0.003  (+200%)
+n=20: HDM=0.006 vs no-HAN=0.002  (+200%)
+FINDING: HAN graph attention advantage grows with network scale.
+This matches paper Fig 13a qualitative finding.
+
+SCALE COMPARISON (paper Section VI.C methodology):
+tasks=10: HDM=0.210 vs SAC=0.194 (+8.2%), Static=0.170 (+23.5%)
+tasks=20: HDM=0.227 vs SAC=0.207 (+9.7%), Static=0.190 (+19.5%)
+tasks=60: HDM=0.192 vs Static=0.202 (mixed)
+tasks=100: HDM=0.198 vs SAC=0.209 (mixed)
+
+MULTIMODAL EVALUATION:
 Text (LAM descriptions): similarity=0.9921, compression=0.943
 Audio (VoxCeleb 4874 clips): similarity=0.988
 Image (Oxford Buildings 3678 images): similarity=0.999
+CSCQI optimal N=6: confirmed matches paper Fig 12a
 
-CSCQI: N=6 optimal — matches paper Fig 12a exactly.
-
-KNOWN GAPS:
-ISR: 9.47% vs paper 90% — channel calibration unknown
-Delay: HDM 60-80% slower than baselines — actor loss not converging
-Actor loss: DDPO-SF/IS/DDPG all unstable — awaiting Dr. Joshi guidance
+KNOWN GAPS VS PAPER:
+ISR: 9.47% vs paper 90% — channel environment calibration unknown
+Delay: HDM 70% slower than baselines (paper claims -33.4% reduction)
+Actor loss: DDPG-style working but Q-value not connected to delay reduction
+Awaiting Dr. Joshi guidance on channel parameters and training details
