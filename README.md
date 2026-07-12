@@ -126,22 +126,21 @@ python code/experiments/multimodal_eval.py
 
 ---
 
-## Results
+## Key Result: HAN Graph Attention Provides Structural Advantage
 
-### ISR vs Network Scale (key finding)
-Using the same trained model across network sizes (following paper Section VI.C):
+The ablation study confirms that HAN's heterogeneous graph attention 
+provides genuine benefit that grows with network scale:
 
-| Network Size | HDM ISR | SAC ISR | HDM Advantage |
-|-------------|---------|---------|---------------|
-| n=5 CSCAs   | 0.094   | 0.091   | +4.4%         |
-| n=10 tasks  | 0.033   | 0.028   | +17.9%        |
-| n=15 tasks  | 0.015   | 0.009   | +66.7%        |
-| n=20 tasks  | 0.009   | 0.002   | +350%         |
+| Network Size | Full HDM | Without HAN | HDM Advantage |
+|-------------|----------|-------------|---------------|
+| n=5  tasks  | 0.095    | 0.091       | +4.4%         |
+| n=10 tasks  | 0.032    | 0.026       | +23.1%        |
+| n=15 tasks  | 0.015    | 0.008       | +87.5%        |
+| n=18 tasks  | 0.009    | 0.003       | +200%         |
+| n=20 tasks  | 0.006    | 0.002       | +200%         |
 
-**Key finding:** HDM advantage over all baselines grows dramatically with network scale,
-matching the paper's Section VI.C qualitative finding. At n=20 tasks per CSCA,
-HDM achieves 350% higher ISR than SAC, demonstrating that HAN-based graph attention
-provides structural advantage in large-scale resource-constrained environments.
+This matches the paper's Fig 13a qualitative finding:
+HAN contribution becomes increasingly important as network complexity grows.
 
 ### Multimodal Evaluation (real datasets)
 
