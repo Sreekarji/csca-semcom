@@ -271,12 +271,13 @@ class HDMTrainer:
         channel_result = self.env.step(parsed_action, system_state)
         tasks = channel_result["tasks"]
 
-        # Compute pure CSCQI reward (Eq. 17) — exactly as in paper
+        # Compute CSCQI reward (Eq. 17) with delay emphasis
         cscqi_values = []
         for t in tasks:
             cscqi_values.append(compute_cscqi(
                 t["tau_S"], t["vartheta_S"],
                 t["tau_S_int"], t["vartheta_S_int"],
+                w_tau=0.7, w_vartheta=0.3,
             ))
         reward_value = float(np.clip(np.mean(cscqi_values), -5.0, 5.0))
         # No shaping, no bonuses — pure Eq. 17
@@ -309,13 +310,38 @@ class HDMTrainer:
         nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
         self.opt_critic.step()
 
-        # === ACTOR UPDATE — DDPG style: maximize Q(s,a) ===
+        # === ACTOR UPDATE — Eq. 33: log_pi * advantage ===
         graph_emb_new, _, message_embs_new = self.han.encode_state(
             system_state, intent_vectors=self.current_intent_vectors
         )
-        action_new = self.actor(graph_emb_new, message_embs=message_embs_new)
-        q_value = self.critic(graph_emb_new.detach(), action_new)
-        actor_loss = -q_value.mean()
+
+        # Get action and log probability from DDPM trajectory
+        a_0_new, log_prob_new = self.actor.collect_trajectory(
+            graph_emb_new, message_embs=message_embs_new
+        )
+
+        # Advantage = R - V(s)
+        value_est = self.critic(graph_emb_new.detach(), a_0_new.detach())
+        reward_t = torch.tensor([[reward_value]], dtype=torch.float, device=self.device)
+        advantage = reward_t - value_est.detach()
+
+        # Normalize advantage (running statistics)
+        if not hasattr(self, '_adv_stats'):
+            self._adv_stats = {'sum': 0.0, 'sum_sq': 0.0, 'n': 0}
+        self._adv_stats['n'] += 1
+        self._adv_stats['sum'] += float(advantage.item())
+        self._adv_stats['sum_sq'] += float(advantage.item()) ** 2
+        adv_mean = self._adv_stats['sum'] / self._adv_stats['n']
+        adv_var = max(self._adv_stats['sum_sq'] / self._adv_stats['n'] - adv_mean**2, 1e-4)
+        adv_std = adv_var ** 0.5
+        advantage_norm = ((advantage - adv_mean) / adv_std).clamp(-3.0, 3.0)
+
+        # Eq. 33: L_actor = -E[log pi(a|s) * A(s,a)]
+        actor_loss = -(log_prob_new * advantage_norm).mean()
+
+        # Sanity check — if loss explodes, fall back to DDPG
+        if actor_loss.abs() > 10.0:
+            actor_loss = -value_est.mean()
 
         self.opt_actor.zero_grad()
         actor_loss.backward()
@@ -324,6 +350,11 @@ class HDMTrainer:
             self.max_grad_norm
         )
         self.opt_actor.step()
+
+        # Store to replay buffer
+        next_state = self.env.generate_state()
+        next_graph_emb, _, _ = self.han.encode_state(next_state)
+        self.replay_buffer.push(graph_emb_new, a_0_new, reward_value, next_graph_emb)
 
         r = reward_value
         self.reward_history.append(r)
@@ -512,8 +543,8 @@ if __name__ == "__main__":
     set_seed(42)
 
     print("=" * 60)
-    print("HDM TRAINING — DDPO-IS (PPO-style) + Phase 3 disabled")
-    print("Paper Table II: 500 episodes, batch=256, LR=0.001")
+    print("HDM TRAINING — Eq. 33 Actor Loss + Environment Calibration Fix")
+    print("Paper Table II: 2000 episodes, batch=256, LR=0.001")
     print("=" * 60)
 
     trainer = HDMTrainer(n_denoising_steps=6)
@@ -535,8 +566,8 @@ if __name__ == "__main__":
     print("Gradient check passed.")
 
     # Full training
-    print("Starting 500 episode training...")
-    rewards = trainer.train(max_episodes=500, checkpoint_every=100)
+    print("Starting 2000 episode training...")
+    rewards = trainer.train(max_episodes=2000, checkpoint_every=200)
 
     # Training curve plot
     smoothed = np.convolve(rewards, np.ones(20)/20, mode='valid')

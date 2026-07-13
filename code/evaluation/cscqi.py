@@ -33,10 +33,17 @@ def compute_cscqi(
     vartheta_S: float,
     tau_S_int: float,
     vartheta_S_int: float,
+    w_tau: float = W_TAU,
+    w_vartheta: float = W_VARTHETA,
 ) -> float:
     delay_score = (TAU_MAX - tau_S) / max(TAU_MAX - tau_S_int, 1e-8)
     quality_score = (VARTHETA_MAX - vartheta_S) / max(VARTHETA_MAX - vartheta_S_int, 1e-8)
-    return W_TAU * delay_score + W_VARTHETA * quality_score
+    cscqi = w_tau * delay_score + w_vartheta * quality_score
+    # Delay penalty: extra penalty when actual delay exceeds intent
+    if tau_S > tau_S_int and tau_S_int > 0:
+        delay_penalty = -2.0 * (tau_S - tau_S_int) / max(tau_S_int, 1e-6)
+        cscqi += delay_penalty
+    return cscqi
 
 
 def compute_isr(tasks: list) -> float:
@@ -93,3 +100,42 @@ def is_intent_satisfied(
     vartheta_S_int: float,
 ) -> bool:
     return tau_S <= tau_S_int and vartheta_S <= vartheta_S_int
+
+
+def adjust_intent(
+    delay_intent: float,
+    quality_intent: float,
+    tau_w: float = 0.0,
+    omega1: float = 0.05,
+    omega2: float = 0.02,
+) -> tuple:
+    """
+    Intent adjustment under high-traffic scenarios (Eq. 19-20).
+    
+    When traffic load is high, intents are relaxed to avoid message failure:
+    - Eq. 19: tau_S,int = tau_S,int * exp(omega1 * tau_w)  (relax delay — allow more time)
+    - Eq. 20: vartheta_S,int = vartheta_S,int * exp(-omega2 * tau_w)  (relax quality — allow lower quality)
+    
+    Args:
+        delay_intent: original delay intent in seconds
+        quality_intent: original quality intent [0,1]
+        tau_w: waiting time proxy (traffic load - 0.5, clamped to [0,1])
+        omega1: attenuation factor for delay intent (paper: 0.05)
+        omega2: attenuation factor for quality intent (paper: 0.02)
+    
+    Returns:
+        (adjusted_delay_intent, adjusted_quality_intent)
+    """
+    import math
+    
+    # Eq. 19: relax delay intent (increase allowed delay)
+    adjusted_delay = delay_intent * math.exp(omega1 * tau_w)
+    
+    # Eq. 20: relax quality intent (decrease quality requirement)
+    adjusted_quality = quality_intent * math.exp(-omega2 * tau_w)
+    
+    # Clamp to reasonable ranges
+    adjusted_delay = min(adjusted_delay, 10.0)  # Max 10 seconds
+    adjusted_quality = max(adjusted_quality, 0.5)  # Min 50% quality
+    
+    return adjusted_delay, adjusted_quality

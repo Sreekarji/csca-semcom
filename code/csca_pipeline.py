@@ -70,7 +70,7 @@ class CSCAPipeline:
         self.han = HANNetwork(
             hidden_channels=256,
             num_heads=8,
-            num_layers=2,
+            num_layers=3,
             n_cscas=n_cscas,
             n_relays=n_relays,
             n_messages=n_cscas,

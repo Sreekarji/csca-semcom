@@ -36,3 +36,30 @@ ISR: 9.47% vs paper 90% — channel environment calibration unknown
 Delay: HDM 70% slower than baselines (paper claims -33.4% reduction)
 Actor loss: DDPG-style working but Q-value not connected to delay reduction
 Awaiting Dr. Joshi guidance on channel parameters and training details
+
+FIXES IMPLEMENTED 2026-07-13:
+==========================================================
+
+1. HAN Eq. 26 — Multi-layer weighted embedding
+   - Added learnable layer_weights for weighted sum across 3 HAN layers
+   - GL_t = sum(softmax(w_l) * H_l) — matches paper Eq. 26
+   - File: code/hdm/han_network.py
+
+2. Semantic distortion calibration (Issue 1.8)
+   - Replaced exp(-0.1 * SINR_dB) proxy with DeepSC-calibrated curve
+   - SNR 0dB→0.70, 5dB→0.50, 10dB→0.30, 15dB→0.15, 20dB→0.07, 25dB→0.03
+   - Quality constraint now meaningful: satisfied only at 20-25dB
+   - File: code/channel/sim_channel.py
+
+3. Message feature consistency (Issue 7.7)
+   - Fixed data_size normalization: clamp(data_size / 10e6, 0, 1) instead of batch min-max
+   - Standardized features: [data_size_norm, semantic_type, delay_urgency, quality_req]
+   - Identical computation in training and evaluation
+   - File: code/hdm/csc_graph_builder.py
+
+4. CSCQI delay emphasis + intent adjustment
+   - w_tau=0.7, w_vartheta=0.3 (delay 70% of reward signal)
+   - Added delay penalty when tau_S > tau_S_int
+   - Eq. 19-20 intent adjustment for high-traffic scenarios
+   - Files: code/evaluation/cscqi.py, code/hdm/hdm_trainer.py, code/channel/sim_channel.py
+

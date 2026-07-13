@@ -125,42 +125,51 @@ def load_trained_baseline(name: str, action_dim: int, device=DEVICE):
     import torch.nn as nn
 
     ckpt_paths = {
-        "SAC": fr"{CKPT_DIR}\sac_trained.pt",
-        "PPO": fr"{CKPT_DIR}\ppo_trained.pt",
-        "AC":  fr"{CKPT_DIR}\ac_trained.pt",
+        "SAC": [
+            fr"{CKPT_DIR}\sac_v2_trained.pt",
+            fr"{CKPT_DIR}\sac_trained.pt",
+        ],
+        "PPO": [
+            fr"{CKPT_DIR}\ppo_v2_trained.pt",
+            fr"{CKPT_DIR}\ppo_trained.pt",
+        ],
+        "AC": [
+            fr"{CKPT_DIR}\ac_v2_trained.pt",
+            fr"{CKPT_DIR}\ac_trained.pt",
+        ],
     }
 
-    if name == "SAC":
-        actor = nn.Sequential(
-            nn.Linear(128, 256), nn.ReLU(),
-            nn.Linear(256, 256), nn.ReLU(),
-            nn.Linear(256, action_dim), nn.Sigmoid()
-        ).to(device)
-    elif name == "PPO":
-        actor = nn.Sequential(
-            nn.Linear(128, 256), nn.ReLU(),
-            nn.Linear(256, action_dim), nn.Sigmoid()
-        ).to(device)
-    elif name == "AC":
-        actor = nn.Sequential(
-            nn.Linear(128, 128), nn.Tanh(),
-            nn.Linear(128, action_dim), nn.Sigmoid()
-        ).to(device)
-    else:
-        raise ValueError(f"Unknown baseline: {name}")
+    paths = ckpt_paths.get(name, [])
+    if isinstance(paths, str):
+        paths = [paths]
 
-    ckpt_path = ckpt_paths.get(name)
-    if ckpt_path and os.path.exists(ckpt_path):
+    # Build actor with default dims (will be rebuilt from checkpoint)
+    actor = nn.Sequential(
+        nn.Linear(256, 256), nn.ReLU(),
+        nn.Linear(256, 256), nn.ReLU(),
+        nn.Linear(256, action_dim), nn.Sigmoid()
+    ).to(device)
+
+    ckpt_path = None
+    for p in paths:
+        if os.path.exists(p):
+            ckpt_path = p
+            break
+
+    if ckpt_path:
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         # Auto-detect architecture from checkpoint keys
         state = ckpt["actor"]
         layer_dims = []
+        first_in_dim = 256  # default
         for k in sorted(state.keys()):
             if k.endswith(".weight"):
                 layer_dims.append(state[k].shape[0])  # output dim
+                if len(layer_dims) == 1:
+                    first_in_dim = state[k].shape[1]  # input dim of first layer
         # Rebuild actor with detected architecture
         layers = []
-        in_dim = 128
+        in_dim = first_in_dim
         for i, out_dim in enumerate(layer_dims):
             layers.append(nn.Linear(in_dim, out_dim))
             if i < len(layer_dims) - 1:

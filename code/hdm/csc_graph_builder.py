@@ -71,13 +71,11 @@ class CSCGraphBuilder:
             relay_feats = _fit(raw_relay, n_r, self.relay_feat_dim)
             bs_feats = _fit(raw_bs, n_b, self.bs_feat_dim)
 
-            # Normalize data sizes to [0,1]
+            # Normalize data sizes to [0,1] using fixed max (10MB)
             data_sizes = torch.tensor(
                 SCt.get("data_sizes", [1e6] * n_m), dtype=torch.float
             )
-            data_sizes_norm = (data_sizes - data_sizes.min()) / (
-                data_sizes.max() - data_sizes.min() + 1e-8
-            )
+            data_sizes_norm = torch.clamp(data_sizes / 10e6, 0.0, 1.0)
 
             # Build message features with REAL intent vectors if provided
             if intent_vectors is not None:
@@ -95,12 +93,12 @@ class CSCGraphBuilder:
                 delay_norm = 1.0 - torch.clamp(delay_intents / 10.0, 0.0, 1.0)
                 intent_t = torch.stack([delay_norm, quality_intents], dim=1)
 
-            # Message features: [data_size_norm, delay_urgency, quality_req, urgency_score]
-            urgency = 0.5 * intent_t[:, 0] + 0.5 * intent_t[:, 1]
+            # Message features: [data_size_norm, semantic_type, delay_urgency, quality_req]
+            semantic_type = torch.rand(n_m)  # Random modality indicator [0,1]
             message_feats = torch.cat([
                 data_sizes_norm.unsqueeze(1),
+                semantic_type.unsqueeze(1),
                 intent_t,
-                urgency.unsqueeze(1),
             ], dim=1)  # shape: [n_m, 4]
 
         else:

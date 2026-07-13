@@ -63,10 +63,13 @@ class HANNetwork(nn.Module):
 
         self.norm = nn.LayerNorm(hidden_channels)
         self.dropout = nn.Dropout(dropout)
+        
+        # Learnable weights for multi-layer aggregation (Eq. 26)
+        self.layer_weights = nn.Parameter(torch.ones(num_layers) / num_layers)
 
     def forward(self, data):
         # Project all node types to hidden_channels
-        x_dict = {
+        x_dict_current = {
             nt: self.dropout(torch.relu(self.input_proj[nt](data[nt].x)))
             for nt in data.node_types
             if nt in self.input_proj
@@ -77,21 +80,29 @@ class HANNetwork(nn.Module):
             for et in data.edge_types
         }
 
-        # L layers of HAN
+        # Collect graph embeddings from each HAN layer
+        layer_embeddings = []
+        
+        # L layers of HAN with residual connections
         for layer in self.han_layers:
-            x_dict_new = layer(x_dict, edge_index_dict)
+            x_dict_new = layer(x_dict_current, edge_index_dict)
             # Residual connection (skip None outputs for isolated nodes)
-            for nt in x_dict:
-                if nt in x_dict_new and x_dict_new[nt] is not None:
-                    x_dict[nt] = self.norm(x_dict_new[nt] + x_dict[nt])
+            for nt in x_dict_new:
+                if nt in x_dict_current and x_dict_new[nt] is not None:
+                    x_dict_current[nt] = self.norm(x_dict_new[nt] + x_dict_current[nt])
+                elif x_dict_new[nt] is not None:
+                    x_dict_current[nt] = self.norm(x_dict_new[nt])
+            
+            # Collect this layer's graph embedding (Eq. 26)
+            layer_all_embs = torch.cat([x_dict_current[nt] for nt in x_dict_current], dim=0)
+            layer_graph_emb = layer_all_embs.mean(dim=0, keepdim=True)
+            layer_embeddings.append(layer_graph_emb)
 
-        # Graph embedding GL_t: mean pool all node embeddings
-        all_embeddings = torch.cat(
-            [x_dict[nt] for nt in x_dict], dim=0
-        )
-        graph_embedding = all_embeddings.mean(dim=0, keepdim=True)
+        # Weighted sum across layers (Eq. 26: GL_t = sum w_l * H_l)
+        layer_weights_norm = torch.softmax(self.layer_weights, dim=0)
+        graph_embedding = sum(w * e for w, e in zip(layer_weights_norm, layer_embeddings))
 
-        return graph_embedding, x_dict
+        return graph_embedding, x_dict_current
 
     def encode_state(self, system_state: dict = None,
                      intent_vectors: list = None):

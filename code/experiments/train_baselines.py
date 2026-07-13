@@ -32,25 +32,25 @@ def log(msg):
 
 
 def train_sac(n_episodes=2000):
-    log("Training SAC baseline...")
-    env = MultiCSCAEnvironment(n_cscas=5, n_relays=5, difficulty="hard")
-    han = HANNetwork(hidden_channels=128, num_heads=8, num_layers=2,
+    log("Training SAC baseline (v2 — calibrated env, 256/3/8 HAN)...")
+    env = MultiCSCAEnvironment(n_cscas=5, n_relays=5)
+    han = HANNetwork(hidden_channels=256, num_heads=8, num_layers=3,
                      n_cscas=5, n_relays=5, n_messages=5, n_base_stations=5).to(DEVICE)
 
     action_dim = 45
     actor = nn.Sequential(
-        nn.Linear(128, 256), nn.ReLU(),
+        nn.Linear(256, 256), nn.ReLU(),
         nn.Linear(256, 256), nn.ReLU(),
         nn.Linear(256, action_dim), nn.Sigmoid()
     ).to(DEVICE)
 
     critic1 = nn.Sequential(
-        nn.Linear(128 + action_dim, 256), nn.ReLU(),
+        nn.Linear(256 + action_dim, 256), nn.ReLU(),
         nn.Linear(256, 1)
     ).to(DEVICE)
 
     critic2 = nn.Sequential(
-        nn.Linear(128 + action_dim, 256), nn.ReLU(),
+        nn.Linear(256 + action_dim, 256), nn.ReLU(),
         nn.Linear(256, 1)
     ).to(DEVICE)
 
@@ -66,7 +66,7 @@ def train_sac(n_episodes=2000):
 
     for ep in range(1, n_episodes + 1):
         state = env.generate_state()
-        graph_emb, _ = han.encode_state(state)
+        graph_emb, _, _ = han.encode_state(state)
 
         # Sample action with noise for exploration
         action = actor(graph_emb)
@@ -134,27 +134,27 @@ def train_sac(n_episodes=2000):
         "actor": actor.state_dict(),
         "critic1": critic1.state_dict(),
         "critic2": critic2.state_dict(),
-    }, os.path.join(CKPT, "sac_trained.pt"))
+    }, os.path.join(CKPT, "sac_v2_trained.pt"))
 
     log(f"SAC training complete. Final reward: {np.mean(rewards[-50:]):.4f}")
     return actor
 
 
 def train_ppo(n_episodes=2000):
-    log("Training PPO baseline...")
-    env = MultiCSCAEnvironment(n_cscas=5, n_relays=5, difficulty="hard")
-    han = HANNetwork(hidden_channels=128, num_heads=8, num_layers=2,
+    log("Training PPO baseline (v2 — calibrated env, 256/3/8 HAN)...")
+    env = MultiCSCAEnvironment(n_cscas=5, n_relays=5)
+    han = HANNetwork(hidden_channels=256, num_heads=8, num_layers=3,
                      n_cscas=5, n_relays=5, n_messages=5, n_base_stations=5).to(DEVICE)
 
     action_dim = 45
     actor = nn.Sequential(
-        nn.Linear(128, 256), nn.ReLU(),
+        nn.Linear(256, 256), nn.ReLU(),
         nn.Linear(256, 256), nn.ReLU(),
         nn.Linear(256, action_dim), nn.Sigmoid()
     ).to(DEVICE)
 
     critic = nn.Sequential(
-        nn.Linear(128, 256), nn.ReLU(),
+        nn.Linear(256, 256), nn.ReLU(),
         nn.Linear(256, 1)
     ).to(DEVICE)
 
@@ -164,7 +164,7 @@ def train_ppo(n_episodes=2000):
 
     for ep in range(1, n_episodes + 1):
         state = env.generate_state()
-        graph_emb, _ = han.encode_state(state)
+        graph_emb, _, _ = han.encode_state(state)
 
         with torch.no_grad():
             old_action = actor(graph_emb)
@@ -205,24 +205,24 @@ def train_ppo(n_episodes=2000):
         if ep % 100 == 0:
             log(f"PPO Episode {ep}/{n_episodes} | Reward: {np.mean(rewards[-50:]):.4f}")
 
-    torch.save({"actor": actor.state_dict()}, os.path.join(CKPT, "ppo_trained.pt"))
+    torch.save({"actor": actor.state_dict()}, os.path.join(CKPT, "ppo_v2_trained.pt"))
     log(f"PPO training complete. Final reward: {np.mean(rewards[-50:]):.4f}")
     return actor
 
 
 def train_ac(n_episodes=2000):
-    log("Training AC baseline...")
-    env = MultiCSCAEnvironment(n_cscas=5, n_relays=5, difficulty="hard")
-    han = HANNetwork(hidden_channels=128, num_heads=8, num_layers=2,
+    log("Training AC baseline (v2 — calibrated env, 256/3/8 HAN)...")
+    env = MultiCSCAEnvironment(n_cscas=5, n_relays=5)
+    han = HANNetwork(hidden_channels=256, num_heads=8, num_layers=3,
                      n_cscas=5, n_relays=5, n_messages=5, n_base_stations=5).to(DEVICE)
 
     action_dim = 45
     actor = nn.Sequential(
-        nn.Linear(128, 128), nn.Tanh(),
+        nn.Linear(256, 128), nn.Tanh(),
         nn.Linear(128, action_dim), nn.Sigmoid()
     ).to(DEVICE)
     critic = nn.Sequential(
-        nn.Linear(128, 128), nn.ReLU(),
+        nn.Linear(256, 128), nn.ReLU(),
         nn.Linear(128, 1)
     ).to(DEVICE)
 
@@ -232,7 +232,7 @@ def train_ac(n_episodes=2000):
 
     for ep in range(1, n_episodes + 1):
         state = env.generate_state()
-        graph_emb, _ = han.encode_state(state)
+        graph_emb, _, _ = han.encode_state(state)
 
         action = actor(graph_emb)
         bw = action[:, :5]
@@ -263,7 +263,7 @@ def train_ac(n_episodes=2000):
         if ep % 100 == 0:
             log(f"AC Episode {ep}/{n_episodes} | Reward: {np.mean(rewards[-50:]):.4f}")
 
-    torch.save({"actor": actor.state_dict()}, os.path.join(CKPT, "ac_trained.pt"))
+    torch.save({"actor": actor.state_dict()}, os.path.join(CKPT, "ac_v2_trained.pt"))
     log(f"AC training complete. Final reward: {np.mean(rewards[-50:]):.4f}")
     return actor
 
@@ -278,7 +278,9 @@ if __name__ == "__main__":
     print("=" * 60)
     print("NOTE: Run this AFTER HDM training (hdm_trainer.py) is complete.")
     print("Checkpoints saved to:")
-    print("  D:\\MP2\\results\\software\\checkpoints\\")
+    print("  D:\\MP2\\results\\software\\checkpoints\\sac_v2_trained.pt")
+    print("  D:\\MP2\\results\\software\\checkpoints\\ppo_v2_trained.pt")
+    print("  D:\\MP2\\results\\software\\checkpoints\\ac_v2_trained.pt")
     print("=" * 60)
 
     start = datetime.now()
@@ -298,9 +300,9 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("ALL BASELINES TRAINED")
     print("Checkpoints saved:")
-    print("  D:\\MP2\\results\\software\\checkpoints\\sac_trained.pt")
-    print("  D:\\MP2\\results\\software\\checkpoints\\ppo_trained.pt")
-    print("  D:\\MP2\\results\\software\\checkpoints\\ac_trained.pt")
+    print("  D:\\MP2\\results\\software\\checkpoints\\sac_v2_trained.pt")
+    print("  D:\\MP2\\results\\software\\checkpoints\\ppo_v2_trained.pt")
+    print("  D:\\MP2\\results\\software\\checkpoints\\ac_v2_trained.pt")
     print(f"Total time: {datetime.now() - start}")
     print("=" * 60)
     print("Next step: run final experiments")
