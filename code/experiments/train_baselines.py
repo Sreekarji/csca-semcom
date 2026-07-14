@@ -274,7 +274,7 @@ if __name__ == "__main__":
     set_seed(42)
     print("=" * 60)
     print("BASELINE TRAINING — SAC, PPO, AC")
-    print("2000 episodes each")
+    print("200 episodes each")
     print("=" * 60)
     print("NOTE: Run this AFTER HDM training (hdm_trainer.py) is complete.")
     print("Checkpoints saved to:")
@@ -286,15 +286,15 @@ if __name__ == "__main__":
     start = datetime.now()
 
     print("\n[1/3] Training SAC...")
-    train_sac(2000)
+    train_sac(200)
     print(f"SAC done. Elapsed: {datetime.now() - start}")
 
     print("\n[2/3] Training PPO...")
-    train_ppo(2000)
+    train_ppo(200)
     print(f"PPO done. Elapsed: {datetime.now() - start}")
 
     print("\n[3/3] Training AC...")
-    train_ac(2000)
+    train_ac(200)
     print(f"AC done. Elapsed: {datetime.now() - start}")
 
     print("\n" + "=" * 60)

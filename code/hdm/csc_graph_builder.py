@@ -94,7 +94,9 @@ class CSCGraphBuilder:
                 intent_t = torch.stack([delay_norm, quality_intents], dim=1)
 
             # Message features: [data_size_norm, semantic_type, delay_urgency, quality_req]
-            semantic_type = torch.rand(n_m)  # Random modality indicator [0,1]
+            # Deterministic semantic type: text=0.0, audio=0.5, image=1.0
+            type_map = [0.0, 0.5, 1.0]  # text, audio, image
+            semantic_type = torch.tensor([type_map[i % 3] for i in range(n_m)], dtype=torch.float)
             message_feats = torch.cat([
                 data_sizes_norm.unsqueeze(1),
                 semantic_type.unsqueeze(1),

@@ -1,0 +1,1061 @@
+================================================================================
+CSCA PROJECT — COMPREHENSIVE CODE AUDIT
+Sun et al. 2026 IEEE TMC — Edge Large AI Model Agent-Empowered Cognitive
+Multimodal Semantic Communication
+Audit Date: 2026-07-12
+Repository: https://github.com/Sreekarji/csca-semcom
+================================================================================
+
+TABLE OF CONTENTS
+  1. CODE AUDIT (22 Python files)
+  2. RESULTS FILES (4 files)
+  3. DOCUMENTATION FILES (4 files)
+  4. GIT LOG (last 10 commits)
+  5. CROSS-FILE CONSTANT/HYPERPARAMETER INDEX
+  6. EQUATION REFERENCE INDEX
+  7. METRIC DEFINITIONS
+
+================================================================================
+1. CODE AUDIT — PYTHON SOURCE FILES
+================================================================================
+
+----------------------------------------------------------------------
+1.1 code/evaluation/cscqi.py
+----------------------------------------------------------------------
+PURPOSE: Core evaluation metrics — CSCQI, ISR, semantic accuracy, compression ratio.
+
+KEY FUNCTIONS:
+  get_semantic_model() -> SentenceTransformer
+    - Lazy-loads all-MiniLM-L6-v2 from D:\MP2\all-MiniLM-L6-v2 on CPU.
+    - Global singleton (_semantic_model).
+
+  compute_cscqi(tau_S, vartheta_S, tau_S_int, vartheta_S_int) -> float
+    - CSCQI metric (paper Eq. 17).
+    - Formula: W_TAU * (TAU_MAX - tau_S)/(TAU_MAX - tau_S_int) + W_VARTHETA * (VARTHETA_MAX - vartheta_S)/(VARTHETA_MAX - vartheta_S_int)
+    - Returns weighted sum of delay score + quality score.
+
+  compute_isr(tasks: list) -> float
+    - Intent Satisfaction Rate.
+    - Counts tasks where tau_S <= tau_S_int AND vartheta_S <= vartheta_S_int.
+    - Returns satisfied/total.
+
+  compute_semantic_accuracy(sent_text, recv_text) -> float
+    - Sentence-level cosine similarity via SentenceTransformer.
+    - Returns value in [0, 1].
+
+  compute_compression_ratio(original_text, simplified_text, original_bits, transmitted_bits) -> float
+    - If bits provided: transmitted_bits / original_bits.
+    - If text provided: simplified_words / original_words.
+
+  is_intent_satisfied(tau_S, vartheta_S, tau_S_int, vartheta_S_int) -> bool
+    - Returns tau_S <= tau_S_int AND vartheta_S <= vartheta_S_int.
+
+HARDCODED CONSTANTS:
+  TAU_MAX = 10.0        (maximum delay in seconds)
+  VARTHETA_MAX = 1.0    (maximum distortion, normalized)
+  W_TAU = 0.5           (delay weight, equal per paper)
+  W_VARTHETA = 0.5      (quality weight)
+  Epsilon 1e-8 in denominators.
+
+DESIGN DECISIONS:
+  - SentenceTransformer loaded on CPU to avoid VRAM contention.
+  - Model path hardcoded to D:\MP2\all-MiniLM-L6-v2 (offline mode).
+
+----------------------------------------------------------------------
+1.2 code/evaluation/shaped_reward.py
+----------------------------------------------------------------------
+PURPOSE: Shaped reward function for HDM training (per-task delay/quality signals + BW-urgency alignment).
+
+KEY FUNCTIONS:
+  compute_shaped_reward(tasks, intent_vector, actions) -> float
+    - Returns float in [-3.0, 3.0].
+    - Components:
+      1. Per-task delay score (0.7 weight): +1.0 if met, -2.0*overshoot if missed, clipped [-3, 2]
+      2. Per-task quality score (0.3 weight): +1.0 if met, -1.0*overshoot if missed, clipped [-2, 1]
+      3. Intent satisfaction bonus: +0.5 flat when both met
+      4. BW-urgency alignment: 0.3 * corrcoef(bandwidth, urgency), -0.1 if uniform BW
+    - Urgency = 1.0 / max(tau_int, 0.1)
+    - Base reward = mean(task_rewards)
+    - Final clipped to [-3.0, 3.0]
+
+  compute_isr_reward(tasks) -> float
+    - ISR for logging (not training). Same as compute_isr in cscqi.py.
+
+HARDCODED CONSTANTS:
+  Weights: 0.7 delay, 0.3 quality, 0.5 bonus, 0.3 alignment
+  Clip ranges: delay [-3, 2], quality [-2, 1], overall [-3, 3]
+  Urgency floor: 0.1
+  Uniform BW penalty: -0.1
+
+DESIGN DECISIONS:
+  - FIX (2026-07-08): Stronger per-task delay signal + BW-urgency alignment bonus.
+  - Rewards HDM for giving more bandwidth to more urgent tasks.
+
+----------------------------------------------------------------------
+1.3 code/evaluation/dataset_loader.py
+----------------------------------------------------------------------
+PURPOSE: Dataset loader for CSCA multimodal evaluation (text/audio/images).
+
+KEY CLASS: DatasetLoader
+  __init__(text_path, audio_dir, image_dir)
+  load_text(n) -> list      — loads SST JSON
+  load_audio(n) -> list     — finds .wav/.mp3/.flac/.ogg files
+  load_images(n) -> list    — finds .jpg/.jpeg/.png files
+  get_batch(modality, n) -> list  — random batch
+  report()                  — prints counts
+
+DEFAULT PATHS:
+  text:  D:\MP2\data\raw\sst_sentences.json
+  audio: D:\MP2\data\raw\audio
+  image: D:\MP2\data\raw\images_google
+
+----------------------------------------------------------------------
+1.4 code/lam/intent_parser.py
+----------------------------------------------------------------------
+PURPOSE: LAM-based intent parser using Qwen2-VL-7B (llama.cpp).
+
+KEY CLASS: IntentParser
+  __init__(model_path, n_gpu_layers=28, n_ctx=512, verbose=False)
+  _extract_array(text) -> list  — JSON parse → regex fallback → single number fallback
+  _normalize(delay_s, quality) -> [delay_norm, quality_norm]
+  parse(intent_text) -> dict    — full pipeline
+  parse_batch(intents) -> list
+
+HARDCODED CONSTANTS:
+  DELAY_MAX = 10.0
+  QUALITY_MAX = 1.0
+  Default fallback: [1.0, 0.8]
+  LLM max_tokens=64, temperature=0.1
+  Model path: D:\MP2\models\Qwen.Qwen2-VL-7B.Q4_K_M.gguf
+
+EQUATIONS:
+  - Delay normalization: delay_norm = clip(1.0 - delay_s / DELAY_MAX, 0, 1)
+  - Quality normalization: quality_norm = clip(quality, 0, 1)
+
+INTENT_PROMPT template: "This sentence may contain the user's intent regarding delay and quality..."
+
+----------------------------------------------------------------------
+1.5 code/lam/source_simplifier.py
+PURPOSE: Source data simplification via MSS (Algorithm 1), MIM (Eq. 5), MCS selection (Eq. 6).
+
+KEY CLASS: SourceSimplifier
+  __init__(model_name="bert-base-uncased", batch_size=64)
+  _get_embedding(text) -> np.ndarray          — BERT [CLS] embedding
+  _get_embeddings_batch(texts) -> np.ndarray  — batched BERT encoding
+  compute_semantic_distance(s1, s2) -> float  — cosine similarity (Eq. 4)
+  find_mss(text, eta=0.60) -> dict            — Algorithm 1
+
+KEY FUNCTIONS (module-level):
+  compute_mim(text) -> float    — Message Importance Metric (Eq. 5)
+    MIM(psi_S) = sum_{f in psi_S} p(f) * exp(-p(f))
+    where p(f) = word frequency
+
+  select_mcs(mim_value, epsilon_weight=0.1) -> dict  — MCS selection (Eq. 6)
+    BER threshold: epsilon_weight * (1 - MIM(psi_S))
+    Iterates MCS table descending, picks highest whose max_ber >= threshold.
+
+HARDCODED CONSTANTS:
+  MCS_TABLE (simplified):
+    index 0: BPSK,  order=2,   rate=0.50, max_ber=1e-1
+    index 1: QPSK,  order=4,   rate=0.50, max_ber=1e-2
+    index 2: 16QAM, order=16,  rate=0.50, max_ber=1e-3
+    index 3: 64QAM, order=64,  rate=0.67, max_ber=1e-4
+    index 4: 256QAM,order=256, rate=0.75, max_ber=1e-5
+  BERT max_length=512
+  BERT model: "bert-base-uncased"
+  Batch size: 64
+  eta default: 0.60
+  epsilon_weight default: 0.1
+  BER numerical floor: 1e-6
+
+DESIGN DECISIONS:
+  - FIX (2026-07-08): Batched BERT encoding. Original called _get_embedding() once per
+    subsequence inside nested loop (exponential calls). New batches all candidates
+    at each removal level into single model.encode() — O(n) per level instead of O(C(n,k)).
+  - BERT forced to CPU to avoid VRAM contention with LAM and SentenceTransformer.
+  - Early-exit on first successful removal level preserved (Algorithm 1).
+
+EQUATIONS REFERENCED:
+  Eq. 4: BERT-based semantic distance (cosine similarity)
+  Eq. 5: MIM = sum p(f) * exp(-p(f))
+  Eq. 6: MCS selection based on MIM and BER constraint
+
+----------------------------------------------------------------------
+1.6 code/lam/rag_intent_parser.py
+----------------------------------------------------------------------
+PURPOSE: RAG-enhanced intent parser with LKB retrieval, cross-encoder reranking, Self-RAG reflection tokens.
+
+KEY CLASS: RAGIntentParser
+  __init__(model_path, n_gpu_layers=28, n_ctx=1024, verbose=False, lkb=None)
+  _llm_generate(prompt, max_tokens=128, stop=None) -> str
+  _extract_json(text) -> dict
+  _check_token(prompt, expected_yes, expected_no) -> bool  — ISREL/ISSUP check
+  _normalize(delay_s, quality) -> [delay_norm, quality_norm]
+  parse(intent_text, max_retries=2) -> dict  — full RAG pipeline
+  _compute_confidence(retrieved, is_relevant, is_supported) -> float
+
+HARDCODED CONSTANTS:
+  DELAY_MAX = 10.0
+  QUALITY_MAX = 1.0
+  Default fallback: delay=1.0, quality=0.8
+  LLM temperature=0.1
+  Model: Qwen2-VL-7B Q4_K_M
+  Initial k=3, increases by 1 per retry
+  Max retries: 2
+  Confidence weights: 0.4 * avg_cos + 0.3 * rerank_norm + 0.15 (ISREL) + 0.15 (ISSUP)
+  Rerank normalization: min(avg_rerank / 10.0, 1.0)
+
+RAG PIPELINE (Section III.B.1):
+  1. Retrieve from LKB using cosine similarity + cross-encoder reranking
+  2. ISREL check (are retrieved examples relevant?)
+  3. Generate intent using LAM with augmented prompt
+  4. ISSUP check (is generated output supported by intent?)
+  5. Retry if checks fail (up to max_retries)
+
+----------------------------------------------------------------------
+1.7 code/lam/lkb.py
+----------------------------------------------------------------------
+PURPOSE: Local Knowledge Base (LKB) for CSCA — stores intent templates, RAG retrieval with cosine + cross-encoder reranking.
+
+KEY CLASS: LocalKnowledgeBase
+  __init__(embedding_model="all-MiniLM-L6-v2", reranker_model="cross-encoder/ms-marco-MiniLM-L-6-v2", templates=None, chunk_size=512)
+  retrieve(query_text, k=3) -> list    — cosine retrieval (top 2k) + cross-encoder reranking → top k
+  chunk_knowledge(max_chunk_chars) -> list  — split templates for LAM context window
+  add_template(text, intent)
+  format_retrieved(retrieved) -> str
+
+HARDCODED CONSTANTS:
+  20 DEFAULT_TEMPLATES in IG1253-like format:
+    7 low-latency intents (time 0.05-1.0s, quality 0.6-0.8)
+    6 high-quality intents (time 3.0-10.0s, quality 0.95-1.0)
+    7 balanced intents (time 2.0-10.0s, quality 0.7-0.9)
+  chunk_size: 512 chars
+  Retrieval: cosine top 2k candidates, then rerank to top k
+
+----------------------------------------------------------------------
+1.8 code/lam/modality_alignment.py
+----------------------------------------------------------------------
+PURPOSE: Aligns text/audio/image modalities to unified text description, then parses intent.
+
+KEY CLASS: ModalityAlignment
+  __init__(whisper_model_dir, whisper_model_size="base", intent_parser=None)
+  _text_to_description(text) -> str        — passthrough
+  _image_to_description(image_path) -> str — Qwen2-VL captioning
+  _audio_to_text(audio_path) -> str        — Whisper transcription
+  align(input_data, modality) -> dict      — full pipeline
+
+MODEL: Whisper base, loaded from D:\MP2\models\whisper
+DEVICE: auto-detect CUDA/CPU
+
+----------------------------------------------------------------------
+1.9 code/hdm/csc_graph_builder.py
+----------------------------------------------------------------------
+PURPOSE: Builds the Cognitive SemCom (CSC) graph Gt = (Vt, Et) as HeteroData for PyG.
+
+KEY CLASS: CSCGraphBuilder
+  __init__(n_cscas=5, n_relays=5, n_messages=5, n_base_stations=5, csca_feat_dim=3, relay_feat_dim=3, message_feat_dim=4, bs_feat_dim=3)
+  build(system_state, intent_vectors) -> HeteroData
+  get_metadata() -> (node_types, edge_types)
+
+NODE TYPES: csca, relay, message, base_station, init
+EDGE TYPES:
+  (csca, comm_conn, base_station)
+  (message, comm_req, csca)
+  (message, semantic_conn, relay)
+  (init, init_conn, csca)
+  (init, init_conn, relay)
+  (init, init_conn, base_station)
+  (init, init_conn, message)
+
+HARDCODED CONSTANTS:
+  Default: n_cscas=5, n_relays=5, n_messages=5, n_base_stations=5
+  Feature dims: csca=3, relay=3, message=4, bs=3, init=3
+  Message features: [data_size_norm, delay_urgency, quality_req, urgency_score]
+  Urgency = 0.5 * delay_urgency + 0.5 * quality_req
+  Data size normalization: (size - min) / (max - min + 1e-8)
+
+DESIGN DECISIONS:
+  - Intent vectors override system_state delay/quality intents.
+  - Edge index validation with clamping for out-of-bounds indices.
+  - Round-robin assignment: csca->bs (mod), message->csca (mod), message->relay (mod).
+  - Init node connects to ALL other node types.
+
+----------------------------------------------------------------------
+1.10 code/hdm/han_network.py
+----------------------------------------------------------------------
+PURPOSE: Heterogeneous Graph Attention Network (HAN) — NLAN + SLAN attention via PyG HANConv.
+
+KEY CLASS: HANNetwork(nn.Module)
+  __init__(hidden_channels=256, num_heads=8, num_layers=3, dropout=0.1, n_cscas=5, n_relays=5, n_messages=5, n_base_stations=5)
+  forward(data) -> (graph_embedding, x_dict)
+  encode_state(system_state, intent_vectors) -> (graph_emb, node_embs, message_embs)
+
+ARCHITECTURE:
+  - Input projection per node type: Linear(in_dim, 256)
+  - 3 layers of HANConv(256, 256, heads=8, dropout=0.1)
+  - LayerNorm + residual connections
+  - Graph embedding: mean pooling over all node embeddings
+  - Returns: graph_emb [1, 256], message_embs [n_tasks, 256]
+
+HARDCODED CONSTANTS:
+  hidden_channels: 256
+  num_heads: 8
+  num_layers: 3
+  dropout: 0.1
+  Input channels: csca=3, relay=3, message=4, base_station=3, init=3
+
+DESIGN DECISIONS:
+  - Residual connections with LayerNorm.
+  - Mean pooling for graph embedding (paper uses weighted sum — MISMATCH).
+
+----------------------------------------------------------------------
+1.11 code/hdm/ddpm_policy.py
+----------------------------------------------------------------------
+PURPOSE: DDPM policy network (MLP denoiser) + Critic network for HDM.
+
+KEY CLASSES:
+  MLPDenoiser(nn.Module):
+    __init__(action_dim=45, graph_emb_dim=256, task_emb_dim=256, hidden_dim=256, n_denoising_steps=6, n_tasks=5)
+    forward(a_n, n, graph_emb, message_embs) -> predicted_noise
+    - Split architecture: task_bw_head (per-task BW) + global_head (relay + MCS)
+    - Time embedding: Embedding(n_steps+1, 256)
+    - task_bw_head: Linear(task_emb+hidden, 256) -> SiLU -> Linear(256, 1)
+    - global_head: Linear(action+graph+hidden, 256) -> SiLU -> Linear(256, 256) -> SiLU -> Linear(256, relay_mcs_dim)
+
+  HDMPolicy(nn.Module):
+    __init__(action_dim=45, graph_emb_dim=256, n_denoising_steps=6, beta_min=0.01, beta_max=0.5, n_tasks=5)
+    _build_schedule()  — precomputes betas, alphas, alphas_cumprod (Eq. 31-32)
+    collect_trajectory(graph_emb, message_embs, batch_size) -> (a_0, total_log_prob)
+    reverse_diffusion(graph_emb, message_embs, batch_size) -> a_0
+    forward(graph_emb, message_embs) -> a_0
+    parse_action(a_0, n_tasks, n_relays, n_mcs) -> {bandwidth, relay, mcs}
+
+  CriticNetwork(nn.Module):
+    __init__(state_dim=256, action_dim=45, hidden_dim=256)
+    forward(graph_emb, action) -> value
+
+HARDCODED CONSTANTS:
+  action_dim: 45 (5 tasks + 5*5 relay + 5*3 mcs)
+  graph_emb_dim: 256
+  n_denoising_steps: 6
+  beta_min: 0.01
+  beta_max: 0.5
+  hidden_dim: 256
+  Activation: SiLU (denoiser), ReLU (critic)
+
+EQUATIONS (DDPM noise schedule):
+  Eq. 31-32: beta_n = 1 - exp(-(beta_min/N) - (2n-1)/(2N^2) * (beta_max - beta_min))
+  Eq. 28-30: reverse diffusion
+    coeff = beta_n / sqrt(1 - alpha_bar_n)
+    mu_theta = (1/sqrt(alpha_n)) * (a_n - coeff * predicted_noise)
+    beta_tilde_n = (1 - alpha_cumprod_prev) / (1 - alpha_cumprod_n) * beta_n  (Eq. 29)
+  Final: a_0 = sigmoid(a_n)
+
+DESIGN DECISIONS:
+  - MLP denoiser (not UNet) — paper explicitly states MLP for faster inference.
+  - Split architecture: task-specific BW head + global relay/MCS head.
+  - DDPO-SF: only final step (n=1) carries gradient; intermediate steps detached.
+  - Log prob: -0.5 * mean((noise - predicted_noise)^2)
+
+----------------------------------------------------------------------
+1.12 code/hdm/hdm_trainer.py
+----------------------------------------------------------------------
+PURPOSE: Trains HDM using Actor-Critic (Algorithm 2) with experience replay + curriculum learning.
+
+KEY CLASSES:
+  ReplayBuffer(capacity=10000):
+    push(state_emb, action, reward, next_state_emb, old_log_prob)
+    sample(batch_size=32) -> batch dict
+
+  CurriculumScheduler:
+    get_difficulty(episode) -> str
+      Phase 1 (0-300): easy
+      Phase 2 (300+): medium
+      Phase 3 (Hard): PERMANENTLY DISABLED
+    get_env_params(episode) -> dict with delay_range, quality_range, data_size_range, distance_range
+
+  HDMTrainer:
+    __init__(n_cscas=5, n_relays=5, n_mcs=3, n_denoising_steps=6, lr_actor=1e-3, lr_critic=1e-3, gamma=0.95, max_grad_norm=1.0)
+    train_episode(system_state) -> (reward, critic_loss, actor_loss, isr)
+    train_batch_episode(batch_size=8) -> (mean_reward, critic_loss, actor_loss, isr)
+    train(max_episodes=500, checkpoint_every=100) -> reward_history
+
+HARDCODED CONSTANTS:
+  lr_actor: 1e-3
+  lr_critic: 1e-3
+  gamma: 0.95
+  max_grad_norm: 1.0
+  ReplayBuffer capacity: 10000
+  Batch size: 256
+  Min buffer size: 64
+  LR scheduler: warmup 10 steps (0.1→1.0), cosine decay T_max=490, eta_min=1e-5
+  Curriculum:
+    Easy: delay (1.0, 5.0), quality (0.2, 0.6), data (1e5, 5e5), distance (0.05, 0.2)
+    Medium: delay (0.5, 3.0), quality (0.4, 0.8), data (5e5, 2e6), distance (0.1, 0.5)
+    Hard: delay (0.1, 1.5), quality (0.6, 0.95), data (1e6, 5e6), distance (0.2, 1.0)
+  Intent generation: i%3==0: urgent (0.7-1.0, 0.3-0.6), i%3==1: quality (0.1-0.4, 0.7-1.0), else: balanced
+  Reward clipping: np.clip(cscqi_mean, -5.0, 5.0)
+  Checkpoint every 50 episodes
+  Best checkpoint saved by ISR
+
+EQUATIONS REFERENCED:
+  Eq. 17: CSCQI reward (pure, no shaping)
+  Eq. 34: cumulative discounted return (referenced in train_batch_episode but implemented as single-step)
+  Eq. 35: critic loss Lv = E[(RW^acc_t - V(st))^2]
+
+DESIGN DECISIONS:
+  - DDPG-style actor loss: actor_loss = -Q(s,a).mean()
+  - NOT paper's Eq. 33 (log-probability weighted advantage) — this is a KNOWN MISMATCH.
+  - Pure CSCQI reward (no shaped reward) — "No shaping, no bonuses — pure Eq. 17"
+  - Phase 3 (Hard) permanently disabled: "too resource constrained, degrades training. ep100 was best because it only saw Phase 1."
+  - Gradient clipping: clip_grad_norm_ with max_grad_norm=1.0
+
+----------------------------------------------------------------------
+1.13 code/channel/sim_channel.py
+----------------------------------------------------------------------
+PURPOSE: Wireless channel simulation with 3GPP parameters.
+
+KEY CLASSES:
+  WirelessChannel:
+    __init__(bandwidth_hz=10e6, block_length=1000, noise_psd_dbm_hz=-174.0, sigma_s=8.0)
+    compute_path_loss_db(d_km) -> float       — 128.1 + 37.6*log10(d_km)
+    compute_shadow_fading_db() -> float        — N(0, sigma_s^2)
+    compute_rsrp(tx_power_dbm, d_km, los) -> float  — Eq. 7
+    compute_interference(interferer_powers_dbm, top_k) -> float  — Eq. 8
+    compute_sinr(rx_power_dbm, interference_linear) -> float  — Eq. 9: phi/(sigma^2+rho)
+    compute_transmission_rate(sinr, ber, use_mcs_table) -> float  — Eq. 10
+    compute_delay(data_size_bits, rate) -> float  — Eq. 12: D_S/nu
+    compute_distortion(sinr) -> float  — Eq. 14 proxy: exp(-0.1*SINR_dB), clipped [0,1]
+    simulate_channel(tx_power_dbm, distance_km, data_size_bits, ...) -> dict
+
+  MultiCSCAEnvironment:
+    __init__(n_cscas=5, n_relays=5, n_base_stations=5, n_mcs=3, bandwidth_total_hz=10e6, difficulty="hard")
+    generate_state() -> dict
+    generate_state_with_params(params) -> dict
+    step(action, state, target_snr_db) -> dict
+
+  HighPressureEnvironment(MultiCSCAEnvironment):
+    - EXTREME intent diversity, TIGHT resources, MIXED urgency
+    - URGENT: 3-5MB, 0.4-0.6s, quality 0.90-1.00
+    - QUALITY: 5-10MB, 3-10s, quality 0.95-1.00
+    - BALANCED: 3-6MB, 0.5-2s, quality 0.90-0.95
+
+HARDCODED CONSTANTS (3GPP):
+  NOISE_PSD_DBM_HZ = -174.0
+  SIGMA_S = 8.0 dB (shadow fading, 3GPP TR 38.901)
+  N_CLUSTERS_LOS = 12 (3GPP TR 36.873 Table 7.3-6)
+  N_CLUSTERS_NLOS = 19
+  N_RAYS = 20 (per cluster)
+  BLOCK_LENGTH = 1000
+  DEFAULT_TX_POWER_DBM = 23.0
+  DEFAULT_BANDWIDTH_HZ = 10e6
+  INTERFERENCE_CELLS = 6 (top-K interferers)
+  BW_SOFTMAX_TEMP = 0.3
+
+EQUATIONS:
+  Eq. 7: RSRP = tx_power - PL + SF + multipath_gain
+  Eq. 8: Interference = sum of top-K interferer powers (linear)
+  Eq. 9: SINR = phi / (sigma^2 + rho)
+  Eq. 10: Rate = C - sqrt(V/n) * Q_inv (finite blocklength), or MCS table
+  Eq. 12: Delay = D_S / nu
+  Eq. 14: Distortion = exp(-0.1 * SINR_dB), clipped [0, 1]
+  Eq. 15: Relay selection (approximation via semantic MI)
+  Eq. 16: Total delay with relay = tau_A,r + tau' + tau_r,B + tau_w
+  Path loss: 128.1 + 37.6 * log10(d_km)
+
+DESIGN DECISIONS:
+  - FIX (2026-07-08): Softmax-temperature BW allocation replaces proportional normalization.
+    Root cause: when HDM outputs similar sigmoid values (~0.5-0.8), proportional normalization
+    cancels to 1/N for every task → identical to static allocation → zero gradient.
+    Softmax with tau=0.3 amplifies small differences: 0.2 logit diff → ~50% BW diff.
+  - TX power scales with BW fraction: 10 + bw_frac * 13
+  - BW floor: 1 kHz
+  - Recovery delay when relay used: data_size / rate * 0.1
+  - Message features: [ds_norm, delay/5.0, quality, urgency = (1-di)*0.5 + (1-qi)*0.5]
+
+----------------------------------------------------------------------
+1.14 code/channel/relay_selection.py
+----------------------------------------------------------------------
+PURPOSE: Semantic relay selection implementing Section IV.B.
+
+KEY CLASSES/FUNCTIONS:
+  SemanticRelay(relay_id, position_km, knowledge_set)
+    distance_to(position_km) -> float
+    set_knowledge_probs(probs)
+
+  compute_distortion(sinr_linear, data_dim=128) -> float  — Eq. 14: exp(-0.1*SINR_dB)
+  compute_symbol_similarity(alpha, beta) -> float  — string overlap or cosine
+  compute_semantic_mi_approximation(sender_knowledge, relay_knowledge) -> float  — Eq. 15 approximation
+  select_relay(distortion_direct, intent_quality, relays, ...) -> dict  — Section IV.B
+  compute_total_delay_with_relay(delay_sender_relay, delay_recovery, delay_relay_receiver, delay_queue) -> float  — Eq. 16
+
+HARDCODED CONSTANTS:
+  DEFAULT_RELAY_KNOWLEDGE: 5 relays with knowledge sets:
+    [0] image/visual/photo/picture/scene
+    [1] audio/speech/voice/sound/music
+    [2] text/language/semantic/meaning/context
+    [3] video/stream/motion/temporal/sequence
+    [4] sensor/data/measurement/signal/numeric
+  DEFAULT_SENDER_KNOWLEDGE: ["multimodal", "semantic", "communication", "intent", "quality"]
+  MI approximation: 0.6 * mi_proxy + 0.4 * max(0, cos_sim)
+
+EQUATIONS:
+  Eq. 15: Semantic Mutual Information (approximated via Jensen-Shannon divergence)
+    JS_approx = kl_approx / (kl_approx + 1.0)
+    MI_proxy = 1.0 - JS_approx
+    Combined = 0.6 * mi_proxy + 0.4 * max(0, cos_sim)
+  Eq. 16: tau_S = tau_A,r + tau' + tau_r,B + tau_w
+
+DESIGN DECISIONS:
+  - Eq. 15 is APPROXIMATED, not exact. True Eq. 15 requires probability distributions
+    P(gamma_S) and P(gamma_hat_S | gamma_S) from LKB deployment.
+  - Relay selection: score = MI * (1 + distortion_improvement)
+  - Sinr approximation: sinr = max(1.0, 100 / max(d, 0.1)^2)
+
+----------------------------------------------------------------------
+1.15 code/channel/deepsc_channel.py
+----------------------------------------------------------------------
+PURPOSE: DeepSC encoder-channel-decoder wrapper for text semantic communication.
+
+KEY CLASS: DeepSCChannel
+  __init__(checkpoint_path, vocab_path, device, channel_type="AWGN")
+  tokenize(text) -> list
+  detokenize(tokens) -> str
+  transmit(text, snr_db=10.0) -> dict
+
+HARDCODED CONSTANTS:
+  DEEPSC_REPO = D:\MP2\repos\DeepSC
+  Checkpoint: D:\MP2\models\deepsc\text\best_model.pth
+  Vocab: D:\MP2\repos\DeepSC\europarl\vocab.json
+  d_model: 128
+  num_heads: 8
+  dff: 512
+  num_layers: 4
+  Channel encoder output: 16 dimensions
+  Compression ratio: 16 / 128 = 12.5%
+
+CHANNEL MODELS:
+  AWGN: x + N(0, n_var)
+  Rayleigh: h*x + noise, h ~ |N(0, 1/sqrt(2))|
+  Rician: h*x + noise, K=3
+
+DESIGN DECISIONS:
+  - Power normalization before channel.
+  - Greedy decode (argmax).
+  - Look-ahead mask for decoder.
+
+----------------------------------------------------------------------
+1.16 code/channel/mcs_table.py
+----------------------------------------------------------------------
+PURPOSE: 3GPP TS 38.214 MCS tables (Tables 5.1.3.1-1, -2, -3).
+
+KEY FUNCTIONS:
+  get_mcs_entry(mcs_index, table=1) -> dict
+  select_mcs_for_sinr(sinr_db, table=1) -> dict
+    - Shannon capacity as upper bound
+    - 85% of Shannon as practical margin
+  compute_rate_from_mcs(mcs_entry, bandwidth_hz) -> float
+
+TABLES:
+  MCS_TABLE_1: 29 entries, QPSK→64QAM (spectral eff 0.2344→5.5547)
+  MCS_TABLE_2: 28 entries, QPSK→256QAM (spectral eff 0.2344→7.4063)
+  MCS_TABLE_3: 30 entries, QPSK→1024QAM (spectral eff 0.2344→8.6523)
+
+HARDCODED CONSTANTS:
+  Shannon margin: 0.85 (85% of Shannon capacity)
+  MOD_NAMES: {2: "QPSK", 4: "16QAM", 6: "64QAM", 8: "256QAM", 10: "1024QAM"}
+
+----------------------------------------------------------------------
+1.17 code/experiments/run_all_experiments.py
+----------------------------------------------------------------------
+PURPOSE: Runs all experiments (Fig 9a, 9c, 12a, 13, Fig 6) + summary table.
+
+KEY FUNCTIONS:
+  match_action_dim(action_raw, n_tasks, n_relays, n_mcs) -> Tensor
+  parse_action(action_raw, n_tasks, n_relays, n_mcs) -> dict
+  load_trained_hdm(n_tasks=5, n_relays=5) -> (han, hdm)
+  load_trained_baseline(name, action_dim) -> BaselineWrapper
+  run_method_episodes_averaged(method_name, get_action_fn, env_fn, han, n_episodes=200, n_seeds=3, n_tasks=5) -> dict
+  experiment_isr_vs_tasks(use_high_pressure=True)  — Fig 9a
+  experiment_delay_vs_sinr()  — Fig 9c
+  experiment_cscqi_convergence()  — Fig 12a
+  experiment_ablation(use_high_pressure=False)  — Fig 13
+  experiment_multimodal_semcom()  — Fig 6
+  generate_summary_table(use_high_pressure=True)
+  experiment_delay_reduction(use_high_pressure=True)  — Fig 9c, 9d
+  experiment_scale_comparison()
+
+HARDCODED CONSTANTS:
+  CHECKPOINT: D:\MP2\results\software\checkpoints\hdm_ep5000.pt
+  tasks_per_csca_list: [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+  sinr_range: [0, 5, 10, 15, 20, 25]
+  n_episodes: 50 (ISR vs tasks), 200 (delay vs SINR), 200 (ablation)
+  n_seeds: 3
+  Static baseline: torch.ones(1, 45) * 0.5
+
+DESIGN DECISIONS:
+  - Multi-seed evaluation (3 seeds) for stability.
+  - HAN hidden=128 for baselines (vs 256 for HDM).
+  - Baseline wrapper with auto-detect architecture from checkpoint.
+  - Projection layer if baseline expects 128-dim but HAN outputs 256.
+
+----------------------------------------------------------------------
+1.18 code/experiments/multimodal_eval.py
+----------------------------------------------------------------------
+PURPOSE: Multimodal semantic communication evaluation (Fig 6).
+
+KEY FUNCTIONS:
+  get_local_semantic_model() -> SentenceTransformer  — local, CPU only
+  batch_encode_subprocess(originals, simplifieds) -> np.array  — subprocess isolation
+  simplify_texts(sentences) -> (simplified_texts, compression_ratios, method)  — MSS with BERT
+  evaluate_text_modality(sentences, snr_range) -> dict
+  evaluate_audio_modality(audio_files, snr_range) -> dict
+  evaluate_image_modality(image_files, snr_range) -> dict
+  generate_fig6(text_results, audio_results, image_results)
+
+HARDCODED CONSTANTS:
+  SNR_RANGE: [0, 5, 10, 15, 20, 25]
+  N_SENTENCES: 100
+  N_AUDIO: 50
+  N_IMAGES: 50
+  MSS eta: 0.60
+  Paper text compression: 0.73
+  Paper audio compression: 0.32
+  Paper image compression: 0.21
+  Data bits per word: 16
+
+DESIGN DECISIONS:
+  - GPU models loaded ONCE, used, then UNLOADED before next model (VRAM management).
+  - Subprocess isolation for SentenceTransformer to avoid BERT+ST segfault.
+  - Word-drop fallback if MSS fails: keep 73% of words.
+  - Image uses text description proxy (not PSNR).
+  - Audio uses Whisper transcription.
+
+----------------------------------------------------------------------
+1.19 code/experiments/text_eval_lam.py
+----------------------------------------------------------------------
+PURPOSE: Text evaluation using LAM-generated descriptions with triple subprocess isolation.
+
+KEY FUNCTION: __main__ script
+  Step 1: LAM intent parsing (subprocess) — 20 intents
+  Step 2: MSS compression (BERT subprocess) — eta=0.70
+  Step 3: Similarity (SentenceTransformer subprocess)
+
+HARDCODED CONSTANTS:
+  10 unique test intents, repeated x2 = 20 total
+  MSS eta: 0.70
+  Paper target: similarity ~0.85, compression ~0.73
+
+----------------------------------------------------------------------
+1.20 code/experiments/baselines.py
+----------------------------------------------------------------------
+PURPOSE: Baseline policy definitions (SAC, AC, PPO, Static).
+
+KEY CLASSES:
+  SACBaseline(state_dim=128, action_dim=45):
+    - Actor: Linear(128,256)->ReLU->Linear(256,256)->ReLU->Linear(256,45)->Sigmoid
+    - LR: 3e-4
+
+  ACBaseline(state_dim=128, action_dim=45):
+    - Actor: Linear(128,128)->Tanh->Linear(128,45)->Sigmoid
+    - LR: 1e-3
+
+  PPOBaseline(state_dim=128, action_dim=45):
+    - Actor: Linear(128,256)->ReLU->Linear(256,45)->Sigmoid
+
+  StaticBaseline(action_dim=45):
+    - Returns torch.ones(batch, 45) * 0.5
+
+----------------------------------------------------------------------
+1.21 code/experiments/train_baselines.py
+----------------------------------------------------------------------
+PURPOSE: Trains SAC, PPO, AC baselines for comparison.
+
+KEY FUNCTIONS:
+  train_sac(n_episodes=2000):
+    - Dual critics, log_alpha for entropy tuning
+    - target_entropy = -action_dim * 0.5
+    - gamma: 0.99
+    - LR: 3e-4
+    - Noise std: 0.1
+
+  train_ppo(n_episodes=2000):
+    - clip_eps: 0.2
+    - 4 inner epochs
+    - LR: 3e-4
+    - Grad clip: 1.0
+
+  train_ac(n_episodes=2000):
+    - LR: 1e-3
+
+HARDCODED CONSTANTS:
+  n_episodes: 2000 each
+  HAN hidden: 128, layers: 2, heads: 8 (for baselines)
+  Action dim: 45
+
+----------------------------------------------------------------------
+1.22 code/experiments/deepsc_baseline.py
+----------------------------------------------------------------------
+PURPOSE: DeepSC baseline for text SemCom (Fig 6 comparison).
+
+KEY CLASS: DeepSCBaseline
+  d_model=128, compression_ratio = 16/128 = 12.5%
+  Uses DeepSCWrapper for inference.
+
+----------------------------------------------------------------------
+1.23 code/experiments/dasc_baseline.py
+----------------------------------------------------------------------
+PURPOSE: DASC baseline for audio SemCom (Fig 6 comparison).
+
+KEY CLASS: DASCBaseline + MELAutoencoder
+  input_dim=80 (mel features), compressed_dim=16
+  Compression ratio: 16/80 = 20%
+  Architecture: Linear(80,64)->ReLU->Linear(64,64)->ReLU->Linear(64,16) (encoder)
+  SNR to noise: 1/sqrt(2*SNR)
+
+----------------------------------------------------------------------
+1.24 code/experiments/rlasc_baseline.py
+----------------------------------------------------------------------
+PURPOSE: RL-ASC baseline for image SemCom (Fig 6 comparison).
+
+KEY CLASS: RLASCBaseline + ImageAutoencoder
+  image_size=32, latent_dim=64
+  Compression ratio: 64/(3*32*32) = 2.08%
+  Architecture: CNN encoder (Conv2d layers) -> latent -> transposed CNN decoder
+  PSNR metric (Eq. 37): 10 * log10(1/MSE)
+  Threshold: PSNR > 22dB = accurate
+
+----------------------------------------------------------------------
+1.25 code/utils/reproducibility.py
+----------------------------------------------------------------------
+PURPOSE: Reproducibility utilities.
+
+KEY FUNCTIONS:
+  set_seed(seed=42):
+    - Sets random, numpy, torch, cuda seeds
+    - cudnn.deterministic = True, cudnn.benchmark = False
+
+  get_seeds_for_evaluation(n_seeds=3) -> [42, 123, 456]
+
+----------------------------------------------------------------------
+1.26 code/csca_pipeline.py
+----------------------------------------------------------------------
+PURPOSE: End-to-end CSCA pipeline (LAM → HDM → Channel).
+
+KEY CLASS: CSCAPipeline
+  __init__(n_cscas=5, n_relays=5, n_mcs=3, n_denoising_steps=6, load_lam=True)
+  parse_intent(user_text) -> dict
+  generate_policy(intent_result, system_state) -> (action, parsed, graph_emb)
+  run_episode(intents, system_state) -> dict
+
+COMPONENTS:
+  Layer 1: IntentParser (Qwen2-VL-7B)
+  Layer 2: HANNetwork (256, 8 heads, 2 layers) + HDMPolicy
+  Layer 3: MultiCSCAEnvironment
+  SourceSimplifier (BERT)
+
+HARDCODED CONSTANTS:
+  HAN: hidden=256, heads=8, layers=2
+  MSS eta: 0.85
+  MIM epsilon_weight: 0.1
+  Default intent vector: [0.9, 0.8]
+
+================================================================================
+2. RESULTS FILES
+================================================================================
+
+----------------------------------------------------------------------
+2.1 results/software/final/FINAL_RESULTS.txt
+----------------------------------------------------------------------
+CHECKPOINT: hdm_best.pt (ep250 equivalent, ISR=0.800 during training)
+Trained with: DDPG-style actor loss, HighPressure env Phase 1-2 only
+
+SUMMARY TABLE (3 seeds x 200 episodes, standard environment):
+  HDM ISR:    0.0947 ± 0.0074  (beats all baselines)
+  SAC ISR:    0.0907 ± 0.0092
+  AC  ISR:    0.0903 ± 0.0105
+  PPO ISR:    0.0913 ± 0.0093
+  Static ISR: 0.0913 ± 0.0090
+  HDM improvement over SAC: +4.4%
+
+ABLATION STUDY (HAN contribution, matches paper Fig 13a):
+  n=5:  HDM=0.095 vs no-HAN=0.091  (+4.4%)
+  n=10: HDM=0.032 vs no-HAN=0.026  (+23.1%)
+  n=15: HDM=0.015 vs no-HAN=0.008  (+87.5%)
+  n=18: HDM=0.009 vs no-HAN=0.003  (+200%)
+  n=20: HDM=0.006 vs no-HAN=0.002  (+200%)
+
+SCALE COMPARISON (paper Section VI.C):
+  tasks=10: HDM=0.210 vs SAC=0.194 (+8.2%), Static=0.170 (+23.5%)
+  tasks=20: HDM=0.227 vs SAC=0.207 (+9.7%), Static=0.190 (+19.5%)
+  tasks=60: HDM=0.192 vs Static=0.202 (mixed)
+  tasks=100: HDM=0.198 vs SAC=0.209 (mixed)
+
+MULTIMODAL EVALUATION:
+  Text (LAM descriptions): similarity=0.9921, compression=0.943
+  Audio (VoxCeleb 4874 clips): similarity=0.988
+  Image (Oxford Buildings 3678 images): similarity=0.999
+  CSCQI optimal N=6: confirmed matches paper Fig 12a
+
+KNOWN GAPS:
+  ISR: 9.47% vs paper 90% — channel environment calibration unknown
+  Delay: HDM 70% slower than baselines (paper claims -33.4% reduction)
+
+----------------------------------------------------------------------
+2.2 results/software/final/key_results_summary.txt
+----------------------------------------------------------------------
+HEADLINE: Ablation study matches paper Fig 13a qualitative trend.
+
+SUMMARY TABLE (3 seeds x 200 episodes):
+  HDM ISR: 0.0947 ± 0.0074
+  SAC ISR: 0.0900 ± 0.0093
+  AC  ISR: 0.0927 ± 0.0095
+  PPO ISR: 0.0917 ± 0.0095
+  Static:  0.0913 ± 0.0090
+
+MULTIMODAL:
+  Text: similarity=0.9921, compression=0.943
+  Audio: similarity=0.988
+  Image: similarity=0.999
+
+CSCQI: N=6 optimal — matches paper Fig 12a exactly.
+
+KNOWN GAPS:
+  ISR: 9.47% vs paper 90%
+  Delay: HDM 60-80% slower than baselines
+  Actor loss: DDPO-SF/IS/DDPG all unstable
+
+----------------------------------------------------------------------
+2.3 results/software/final/paper_vs_implementation_verification.txt
+----------------------------------------------------------------------
+PARAMETER VERIFICATION (Table II):
+  MATCHES: HAN hidden=256, layers=3, DDPM steps=6, MLP hidden=256,
+           batch=256, LR=0.001, gamma=0.95, CSCAs=5, relays=5, action_dim=45
+  MISMATCHES: num_heads (6→8), episodes (100→500), delay intent range,
+              SINR range (0-18→0-25dB), task count (2-20/CSCA→2-20 total)
+
+ISR DEFINITION:
+  Paper: cosine_sim > 80% AND delay <= intent AND quality <= intent
+  Ours: delay <= intent AND quality <= intent (no semantic accuracy check)
+  Impact: our ISR is INFLATED but still lower than paper's
+
+CHANNEL MODEL:
+  All 3GPP constants match. Missing: mmWave MIMO (MODERATE impact).
+
+HAN GRAPH:
+  Node types match. Edge types match. Graph embedding: mean pooling vs weighted sum (LOW impact).
+
+DDPM POLICY:
+  Noise schedule matches. Reverse diffusion matches.
+  Actor loss: DDPG vs log*pi*A (HIGH impact — primary cause of gap).
+  Reward: single-step vs cumulative (MODERATE impact).
+
+VERDICT: Task count mismatch (HIGH) + Actor loss formulation (HIGH) = primary causes.
+Fixable without paper's code: implement DDPO-IS, fix task counts, fix reward.
+
+----------------------------------------------------------------------
+2.4 results/software/final/failure_research_report.txt
+----------------------------------------------------------------------
+TASK 1 — DDPM ACTOR LOSS ROOT CAUSE:
+  Current: log_pi = -tanh(MSE(noise, predicted_noise)/10)  — WRONG
+  Correct (DDPO, Black et al. 2023): log p(x_{t-1}|x_t, c) = -||x_{t-1} - mu_theta||^2 / (2*sigma_t^2)
+  Key insight: reward is SAME for all denoising steps; only log-probs change.
+  Our errors: (1) noise MSE not reconstruction likelihood, (2) single step not all T,
+  (3) tanh normalization destroys gradient, (4) single-step advantage.
+
+TASK 2 — ALTERNATIVE CHANNELS:
+  DeepMIMO: pip installable, 3GPP TR 38.901, CPU-based. RECOMMENDED.
+  Sionna: NVIDIA, TensorFlow, GPU. Too heavy.
+  QuaDRiGa: MATLAB only. Not viable.
+
+TASK 3 — COMPRESSION RATIO:
+  Paper's 73% = MSS on LAM descriptions (longer, more redundant).
+  Our 93% = MSS on SST sentences (already concise).
+  Fix: lower eta from 0.85 to 0.6, evaluate on LAM outputs.
+
+TASK 5 — RANKED ACTIONS:
+  1. Fix actor loss (DDPO-IS): 2-4h, expected 20%→40-60% ISR
+  2. Fix compression (eta=0.6): 30min, 0.93→0.70-0.75
+  3. Add DeepMIMO: 2-3h, 5-10% ISR improvement
+  4. Fix task count: DONE
+  5. Train longer: 1-2h
+  6. Retrain baselines: 1-2h
+
+================================================================================
+3. DOCUMENTATION FILES
+================================================================================
+
+----------------------------------------------------------------------
+3.1 README.md
+----------------------------------------------------------------------
+- Paper: Sun et al. 2026 IEEE TMC, DOI: 10.1109/TMC.2025.3590723
+- Author: Sreekar Balagoni, B.Tech ECE, Vasavi College of Engineering
+- Research Internship: ViSRI Lab, BITS Pilani, under Dr. Sandeep Joshi
+- Architecture: LAM (left brain) → HDM (right brain) → Channel
+- Models: Qwen2-VL-7B Q4_K_M, Whisper base, all-MiniLM-L6-v2, Stable Diffusion 2.1
+- Hardware: RTX 4050 6GB VRAM
+
+----------------------------------------------------------------------
+3.2 CONTRIBUTING.md
+----------------------------------------------------------------------
+Known issues:
+  1. ISR gap (HIGH): 20% vs 90%, channel calibration unknown
+  2. Actor loss instability (HIGH): DDPO-SF clamps to ±100
+  3. DeepSC text similarity (MEDIUM): 0.31, trained on Europarl not SST
+  4. Channel model (LOW): simplified numpy, not 3GPP mmWave
+
+----------------------------------------------------------------------
+3.3 docs/implementation_notes.md
+----------------------------------------------------------------------
+Key differences from paper:
+  LAM: LLaVA-NeXT → Qwen2-VL-7B (4-bit GGUF)
+  Channel: Full 3GPP → simplified numpy
+  Training: 100 → 500 episodes
+  Actor loss: Eq. 33 → DDPO-SF approximation
+  Compression: DeepSC neural codec → MSS + DeepSC hybrid
+
+What works correctly:
+  - CSCQI metric (Eq. 17) — exact match
+  - HAN graph structure — matches paper
+  - DDPM noise schedule (Eq. 31-32) — matches paper
+  - N=6 optimal denoising — confirmed
+  - Scale comparison trend — matches Section VI.C
+
+----------------------------------------------------------------------
+3.4 requirements.txt
+----------------------------------------------------------------------
+Key dependencies: torch>=2.6.0, torch-geometric>=2.8.0, transformers>=4.30.0,
+sentence-transformers>=2.2.0, llama-cpp-python>=0.2.0, openai-whisper>=20231117
+
+================================================================================
+4. GIT LOG (last 10 commits)
+================================================================================
+
+1. e7d087d | results: final experiment run - DDPG actor, ablation confirms HAN advantage
+   - Added FINAL_RESULTS.txt, key_results_summary.txt
+   - Final ablation data confirming HAN advantage grows with scale
+
+2. de42aae | ci: simplify to syntax-only check - no heavy dependencies
+   - GitHub Actions simplified to avoid heavy ML dependency installs
+
+3. d16c738 | docs: final results summary - ablation confirms HAN advantage grows with scale
+   - Updated summary docs with ablation findings
+
+4. 20f6a74 | docs: highlight ablation as key result - HAN advantage grows with scale
+   - README updated to foreground ablation as headline result
+
+5. b16570d | feat: DDPO-IS actor loss + disable Phase 3 curriculum + retrain 500ep
+   - Major: attempted DDPO-IS implementation
+   - Disabled Phase 3 (hard) curriculum permanently
+   - Extended training to 500 episodes
+
+6. f7fd932 | docs: add contributing guide and implementation notes
+   - CONTRIBUTING.md and docs/implementation_notes.md added
+
+7. 3f6d5c9 | ci: add GitHub Actions CI for syntax and unit tests
+   - CI pipeline for .py syntax check
+
+8. 0b0270a | fix: restore gradient flow in DDPO-SF collect_trajectory
+   - Fixed gradient detachment issue in denoising trajectory
+
+9. 5babb4f | feat: add LAM-description text evaluation matching paper methodology
+   - Triple subprocess isolation for LAM/MSS/ST evaluation
+
+10. 311cada | feat: add end-to-end demo notebook
+    - CSCAPipeline end-to-end demo
+
+================================================================================
+5. CROSS-FILE CONSTANT/HYPERPARAMETER INDEX
+================================================================================
+
+CONSTANT              | VALUE           | FILES
+----------------------|-----------------|--------------------------------------------
+TAU_MAX               | 10.0            | cscqi.py, intent_parser.py, rag_intent_parser.py
+VARTHETA_MAX          | 1.0             | cscqi.py
+W_TAU                 | 0.5             | cscqi.py
+W_VARTHETA            | 0.5             | cscqi.py
+DELAY_MAX             | 10.0            | intent_parser.py, rag_intent_parser.py
+QUALITY_MAX           | 1.0             | intent_parser.py, rag_intent_parser.py
+NOISE_PSD_DBM_HZ      | -174.0          | sim_channel.py
+SIGMA_S               | 8.0 dB          | sim_channel.py
+DEFAULT_BANDWIDTH_HZ  | 10e6            | sim_channel.py
+DEFAULT_TX_POWER_DBM  | 23.0            | sim_channel.py
+INTERFERENCE_CELLS    | 6               | sim_channel.py
+BLOCK_LENGTH          | 1000            | sim_channel.py
+BW_SOFTMAX_TEMP       | 0.3             | sim_channel.py
+N_CLUSTERS_LOS        | 12              | sim_channel.py
+N_CLUSTERS_NLOS       | 19              | sim_channel.py
+N_RAYS                | 20              | sim_channel.py
+hidden_channels (HAN) | 256             | han_network.py, hdm_trainer.py, csca_pipeline.py
+num_heads             | 8               | han_network.py, hdm_trainer.py
+num_layers (HAN)      | 3               | han_network.py, hdm_trainer.py (2 in csca_pipeline.py)
+n_denoising_steps     | 6               | ddpm_policy.py, hdm_trainer.py, csca_pipeline.py
+beta_min              | 0.01            | ddpm_policy.py
+beta_max              | 0.5             | ddpm_policy.py
+action_dim            | 45              | ddpm_policy.py, baselines.py, run_all_experiments.py
+lr_actor              | 1e-3            | hdm_trainer.py
+lr_critic             | 1e-3            | hdm_trainer.py
+gamma                 | 0.95            | hdm_trainer.py
+max_grad_norm         | 1.0             | hdm_trainer.py
+batch_size            | 256             | hdm_trainer.py
+ReplayBuffer capacity | 10000           | hdm_trainer.py
+min_buffer_size       | 64              | hdm_trainer.py
+Shannon margin        | 0.85            | mcs_table.py
+DEFAULT_SEED          | 42              | reproducibility.py
+d_model (DeepSC)      | 128             | deepsc_channel.py
+num_heads (DeepSC)    | 8               | deepsc_channel.py
+dff (DeepSC)          | 512             | deepsc_channel.py
+num_layers (DeepSC)   | 4               | deepsc_channel.py
+channel_encoder_dim   | 16              | deepsc_channel.py
+
+================================================================================
+6. EQUATION REFERENCE INDEX
+================================================================================
+
+EQ  | DESCRIPTION                              | FILE(S)                    | STATUS
+----|------------------------------------------|----------------------------|--------
+Eq. 4  | BERT-based semantic distance (cosine)  | source_simplifier.py       | IMPLEMENTED
+Eq. 5  | MIM = sum p(f)*exp(-p(f))              | source_simplifier.py       | IMPLEMENTED
+Eq. 6  | MCS selection based on MIM + BER       | source_simplifier.py       | IMPLEMENTED
+Eq. 7  | RSRP = tx_power - PL + SF + MP gain    | sim_channel.py             | IMPLEMENTED
+Eq. 8  | Inter-cell interference (top-K sum)    | sim_channel.py             | IMPLEMENTED
+Eq. 9  | SINR = phi / (sigma^2 + rho)           | sim_channel.py             | IMPLEMENTED
+Eq. 10 | Finite blocklength rate                 | sim_channel.py             | IMPLEMENTED
+Eq. 12 | Delay = D_S / nu                       | sim_channel.py             | IMPLEMENTED
+Eq. 14 | Distortion = exp(-0.1*SINR_dB)         | sim_channel.py, relay_sel  | IMPLEMENTED (proxy)
+Eq. 15 | Semantic Mutual Information             | relay_selection.py         | APPROXIMATED
+Eq. 16 | Total delay with relay                  | relay_selection.py         | IMPLEMENTED
+Eq. 17 | CSCQI metric                            | cscqi.py                   | IMPLEMENTED (exact)
+Eq. 21-23 | NLAN (node-level attention)          | han_network.py (via HANConv)| DELEGATED TO PyG
+Eq. 24-26 | SLAN (semantic-level attention)      | han_network.py (via HANConv)| DELEGATED TO PyG
+Eq. 26 | Graph embedding (weighted sum)         | han_network.py             | MISMATCH (mean pool)
+Eq. 28-30 | DDPM reverse diffusion               | ddpm_policy.py             | IMPLEMENTED
+Eq. 31-32 | DDPM noise schedule (var. posterior) | ddpm_policy.py             | IMPLEMENTED
+Eq. 33 | Actor loss (log*pi*A)                   | hdm_trainer.py             | MISMATCH (uses -Q(s,a))
+Eq. 34 | Cumulative discounted return            | hdm_trainer.py             | MISMATCH (single-step)
+Eq. 35 | Critic loss Lv = E[(RW-V)^2]           | hdm_trainer.py             | IMPLEMENTED
+Eq. 37 | PSNR threshold (image accuracy)        | rlasc_baseline.py          | IMPLEMENTED
+Eq. 48 | Path loss model reference               | sim_channel.py             | IMPLEMENTED
+
+================================================================================
+7. METRIC DEFINITIONS
+================================================================================
+
+METRIC  | FORMULA                                         | FILE
+--------|-------------------------------------------------|------------------
+CSCQI   | W_TAU*(TAU_MAX-tau_S)/(TAU_MAX-tau_S_int) +    | cscqi.py
+        | W_VARTHETA*(VARTHETA_MAX-vartheta_S)/(VARTHETA_MAX-vartheta_S_int)
+ISR     | count(tau_S<=tau_S_int AND vartheta_S<=vartheta_S_int) / total | cscqi.py
+Semantic Accuracy | cosine_sim(encode(sent), encode(recv))    | cscqi.py (SentenceTransformer)
+Compression Ratio | simplified_words / original_words          | cscqi.py
+                  | transmitted_bits / original_bits            |
+MIM     | sum_{f in psi_S} p(f) * exp(-p(f))             | source_simplifier.py
+Distortion | exp(-0.1 * SINR_dB), clipped [0,1]           | sim_channel.py, relay_selection.py
+PSNR    | 10 * log10(1 / MSE)                            | rlasc_baseline.py
+Semantic MI (approx) | 0.6*(1-JS_approx) + 0.4*max(0,cos_sim) | relay_selection.py
+Shaped Reward | 0.7*delay_score + 0.3*quality_score +      | shaped_reward.py
+              | 0.5*intent_bonus + 0.3*bw_urgency_corr
+
+================================================================================
+END OF AUDIT
+================================================================================

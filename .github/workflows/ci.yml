@@ -1,34 +1,18 @@
-name: CSCA CI
-
-on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-
+name: CSCA Check
+on: [push]
 jobs:
-  syntax-check:
+  check:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
-
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-
-    - name: Syntax check all Python files
+    - name: Check key files exist
       run: |
-        echo "Checking syntax of all Python files..."
-        find code/ -name "*.py" -exec python -m py_compile {} \;
-        echo "All Python files passed syntax check."
-
-    - name: Verify key files exist
-      run: |
-        test -f code/evaluation/cscqi.py && echo "cscqi.py exists"
-        test -f code/hdm/hdm_trainer.py && echo "hdm_trainer.py exists"
-        test -f code/hdm/han_network.py && echo "han_network.py exists"
-        test -f code/hdm/ddpm_policy.py && echo "ddpm_policy.py exists"
-        test -f code/channel/sim_channel.py && echo "sim_channel.py exists"
-        test -f code/csca_pipeline.py && echo "csca_pipeline.py exists"
+        test -f code/evaluation/cscqi.py
+        test -f code/hdm/hdm_trainer.py
+        test -f code/hdm/han_network.py
+        test -f code/hdm/ddpm_policy.py
+        test -f code/channel/sim_channel.py
+        test -f code/csca_pipeline.py
+        test -f README.md
+        test -f requirements.txt
         echo "All key files present."

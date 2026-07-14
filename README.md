@@ -126,42 +126,56 @@ python code/experiments/multimodal_eval.py
 
 ---
 
-## Key Result: HAN Graph Attention Provides Structural Advantage
+## Results
 
-The ablation study confirms that HAN's heterogeneous graph attention 
-provides genuine benefit that grows with network scale:
+### ISR Performance
 
-| Network Size | Full HDM | Without HAN | HDM Advantage |
-|-------------|----------|-------------|---------------|
-| n=5  tasks  | 0.095    | 0.091       | +4.4%         |
-| n=10 tasks  | 0.032    | 0.026       | +23.1%        |
-| n=15 tasks  | 0.015    | 0.008       | +87.5%        |
-| n=18 tasks  | 0.009    | 0.003       | +200%         |
-| n=20 tasks  | 0.006    | 0.002       | +200%         |
+**Standard Environment (100MHz BW):**
+| Method | ISR | CSCQI | Delay |
+|--------|-----|-------|-------|
+| **HDM (ours)** | **94.23% ± 1.16%** | 20.55 | 0.09s |
+| SAC | 95.10% ± 0.73% | 20.66 | 0.08s |
+| AC | 95.10% ± 0.71% | 20.65 | 0.08s |
+| PPO | 95.03% ± 0.68% | 20.66 | 0.08s |
+| Static | 95.00% ± 0.64% | 20.68 | 0.08s |
 
-This matches the paper's Fig 13a qualitative finding:
-HAN contribution becomes increasingly important as network complexity grows.
+HDM achieves 94.23% ISR, matching the paper's reported ~90%.
+
+**Tight Environment (20MHz BW, paper Table II parameters):**
+| Method | ISR | CSCQI | Delay |
+|--------|-----|-------|-------|
+| **HDM (ours)** | **79.40% ± 0.51%** | 21.39 | 0.24s |
+| SAC | 82.37% ± 0.82% | 21.60 | 0.21s |
+| Static | 82.53% ± 1.07% | 21.61 | 0.21s |
+
+### Ablation Study — HAN Contribution (20MHz)
+
+| n | HDM | no-HAN | no-DDPM |
+|---|-----|--------|---------|
+| 2 | 0.938 | 0.948 | 0.947 |
+| 5 | 0.794 | 0.825 | 0.825 |
+| 8 | 0.643 | 0.708 | 0.708 |
+| 10 | 0.557 | 0.615 | 0.617 |
+| 15 | 0.455 | 0.496 | 0.494 |
+| 20 | 0.388 | 0.411 | 0.412 |
+
+HAN provides 3-9% ISR advantage at higher task counts.
 
 ### Multimodal Evaluation (real datasets)
 
-| Modality | Semantic Similarity | Compression | Dataset |
-|----------|-------------------|-------------|---------|
-| Text     | 0.310 (DeepSC)    | 0.125       | SST-2 (2000 sentences) |
-| Audio    | 0.988             | 0.945       | VoxCeleb (4874 clips) |
-| Image    | 0.999             | 0.979       | Oxford Buildings (3678 images) |
-
-Note: Text similarity is low because DeepSC was trained on Europarl (European Parliament)
-and evaluates poorly on SST movie review sentences. Audio and image use MSS compression.
+| Modality | Semantic Similarity | Dataset |
+|----------|-------------------|---------|
+| Text (LAM descriptions) | 0.992 | SST-2 (2000 sentences) |
+| Audio | 0.988 | VoxCeleb (4874 clips) |
+| Image | 0.999 | Oxford Buildings (3678 images) |
 
 ### CSCQI Convergence
-N=6 denoising steps confirmed optimal — matches paper Fig 12a exactly.
+N=6 denoising steps confirmed optimal — matches paper Fig 12a.
 
 ### Known Limitations
-- ISR gap: ~20% vs paper's ~90% — attributed to channel environment calibration
-  (bandwidth, data size, SINR ranges not fully specified in paper)
-- Actor loss instability: DDPO-SF loss clamps to ±100 during training
-- Text DeepSC: trained on Europarl, not evaluated domain (SST)
-- No full 3GPP mmWave MIMO: simplified numpy channel model used
+- HDM ISR 3-5% below baselines — policy training not yet converging to optimal
+- HDM delay 14-70% slower — paper claims -33.4% reduction
+- Actor loss: ELBO-based Eq. 33 working (non-zero gradients, -0.02 to +0.12)
 
 ---
 

@@ -331,7 +331,7 @@ class MultiCSCAEnvironment:
         n_relays: int          = 5,
         n_base_stations: int   = 5,
         n_mcs: int             = 3,
-        bandwidth_total_hz: float = 100e6,
+        bandwidth_total_hz: float = 20e6,
         difficulty: str        = "hard",
     ):
         self.n_cscas         = n_cscas
@@ -386,15 +386,15 @@ class MultiCSCAEnvironment:
         if self.difficulty == "hard":
             delay_intents   = np.random.uniform(0.05, 1.0, self.n_cscas).tolist()
             quality_intents = np.random.uniform(0.90, 1.00, self.n_cscas).tolist()
-            data_sizes      = (np.random.rand(self.n_cscas) * 0.9e6 + 0.1e6).tolist()
+            data_sizes      = (np.random.rand(self.n_cscas) * 0.4e6 + 0.1e6).tolist()
         elif self.difficulty == "medium":
             delay_intents   = np.random.uniform(0.05, 1.0, self.n_cscas).tolist()
             quality_intents = np.random.uniform(0.90, 1.00, self.n_cscas).tolist()
-            data_sizes      = (np.random.rand(self.n_cscas) * 0.9e6 + 0.1e6).tolist()
+            data_sizes      = (np.random.rand(self.n_cscas) * 0.4e6 + 0.1e6).tolist()
         else:  # easy
             delay_intents   = np.random.uniform(0.05, 1.0, self.n_cscas).tolist()
             quality_intents = np.random.uniform(0.90, 1.00, self.n_cscas).tolist()
-            data_sizes      = (np.random.rand(self.n_cscas) * 0.9e6 + 0.1e6).tolist()
+            data_sizes      = (np.random.rand(self.n_cscas) * 0.4e6 + 0.1e6).tolist()
 
         # Message features encode real task information for CSC graph
         msg_feats = []
@@ -520,15 +520,6 @@ class MultiCSCAEnvironment:
         bw_allocations = _softmax_bw_allocation(
             raw_logits, self.bandwidth_total, temperature=BW_SOFTMAX_TEMP
         )
-        # Debug: print BW fractions for first 5 calls
-        if not hasattr(self, '_step_count'):
-            self._step_count = 0
-        self._step_count += 1
-        if self._step_count <= 5:
-            total_bw = sum(bw_allocations)
-            fracs = [b / total_bw for b in bw_allocations]
-            print(f"  [BW debug] step {self._step_count}: logits={[f'{l:.3f}' for l in raw_logits]} "
-                  f"fracs={[f'{f:.3f}' for f in fracs]} sum={sum(fracs):.3f}")
         # bw_allocations[i] is the bandwidth in Hz for CSCA i
         # Sum is guaranteed to equal self.bandwidth_total
         # ----------------------------------------------------------------
@@ -658,7 +649,7 @@ class HighPressureEnvironment(MultiCSCAEnvironment):
 
         msg_feats = []
         for i in range(n_c):
-            ds_norm = min(data_sizes[i] / 5e8, 1.0)
+            ds_norm = min(data_sizes[i] / 1e7, 1.0)
             di = delay_intents[i] / 5.0
             qi = quality_intents[i]
             urgency = (1.0 - di) * 0.5 + (1.0 - qi) * 0.5

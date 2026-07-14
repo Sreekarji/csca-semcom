@@ -1,29 +1,34 @@
-=== CSCA FINAL RESULTS — July 12 2026 ===
-Checkpoint: hdm_best.pt (ep250 equivalent, ISR=0.800 during training)
-Trained with: DDPG-style actor loss, HighPressure env Phase 1-2 only
+=== CSCA FINAL RESULTS — July 14 2026 ===
+Checkpoint: hdm_best.pt (ELBO-based Eq. 33 actor loss)
+Environment: 20MHz BW, 0.1-0.5MB data, paper Table II intents
 
-SUMMARY TABLE (3 seeds x 200 episodes, standard environment):
-HDM ISR:    0.0947 ± 0.0074  <- beats all baselines
-SAC ISR:    0.0907 ± 0.0092
-AC  ISR:    0.0903 ± 0.0105
-PPO ISR:    0.0913 ± 0.0093
-Static ISR: 0.0913 ± 0.0090
-HDM improvement over SAC: +4.4%
+STANDARD RESULTS (July 13, 100MHz environment):
+| Method | ISR | CSCQI | Delay |
+|--------|-----|-------|-------|
+| HDM | 94.23% ± 1.16% | 20.55 | 0.09s |
+| SAC | 95.10% ± 0.73% | 20.66 | 0.08s |
+| AC | 95.10% ± 0.71% | 20.65 | 0.08s |
+| PPO | 95.03% ± 0.68% | 20.66 | 0.08s |
+| Static | 95.00% ± 0.64% | 20.68 | 0.08s |
 
-ABLATION STUDY — HAN contribution (key finding, matches paper Fig 13a):
-n=5:  HDM=0.095 vs no-HAN=0.091  (+4.4%)
-n=10: HDM=0.032 vs no-HAN=0.026  (+23.1%)
-n=15: HDM=0.015 vs no-HAN=0.008  (+87.5%)
-n=18: HDM=0.009 vs no-HAN=0.003  (+200%)
-n=20: HDM=0.006 vs no-HAN=0.002  (+200%)
-FINDING: HAN graph attention advantage grows with network scale.
-This matches paper Fig 13a qualitative finding.
+TIGHT RESULTS (July 14, 20MHz environment):
+| Method | ISR | CSCQI | Delay |
+|--------|-----|-------|-------|
+| HDM | 79.40% ± 0.51% | 21.39 | 0.24s |
+| SAC | 82.37% ± 0.82% | 21.60 | 0.21s |
+| AC | 82.27% ± 0.98% | 21.59 | 0.21s |
+| PPO | 82.37% ± 0.86% | 21.59 | 0.21s |
+| Static | 82.53% ± 1.07% | 21.61 | 0.21s |
 
-SCALE COMPARISON (paper Section VI.C methodology):
-tasks=10: HDM=0.210 vs SAC=0.194 (+8.2%), Static=0.170 (+23.5%)
-tasks=20: HDM=0.227 vs SAC=0.207 (+9.7%), Static=0.190 (+19.5%)
-tasks=60: HDM=0.192 vs Static=0.202 (mixed)
-tasks=100: HDM=0.198 vs SAC=0.209 (mixed)
+ABLATION (20MHz, HAN contribution):
+| n | HDM | no-HAN | no-DDPM |
+|---|-----|--------|---------|
+| 2 | 0.938 | 0.948 | 0.947 |
+| 5 | 0.794 | 0.825 | 0.825 |
+| 8 | 0.643 | 0.708 | 0.708 |
+| 10 | 0.557 | 0.615 | 0.617 |
+| 15 | 0.455 | 0.496 | 0.494 |
+| 20 | 0.388 | 0.411 | 0.412 |
 
 MULTIMODAL EVALUATION:
 Text (LAM descriptions): similarity=0.9921, compression=0.943
@@ -31,35 +36,7 @@ Audio (VoxCeleb 4874 clips): similarity=0.988
 Image (Oxford Buildings 3678 images): similarity=0.999
 CSCQI optimal N=6: confirmed matches paper Fig 12a
 
-KNOWN GAPS VS PAPER:
-ISR: 9.47% vs paper 90% — channel environment calibration unknown
-Delay: HDM 70% slower than baselines (paper claims -33.4% reduction)
-Actor loss: DDPG-style working but Q-value not connected to delay reduction
-Awaiting Dr. Joshi guidance on channel parameters and training details
-
-FIXES IMPLEMENTED 2026-07-13:
-==========================================================
-
-1. HAN Eq. 26 — Multi-layer weighted embedding
-   - Added learnable layer_weights for weighted sum across 3 HAN layers
-   - GL_t = sum(softmax(w_l) * H_l) — matches paper Eq. 26
-   - File: code/hdm/han_network.py
-
-2. Semantic distortion calibration (Issue 1.8)
-   - Replaced exp(-0.1 * SINR_dB) proxy with DeepSC-calibrated curve
-   - SNR 0dB→0.70, 5dB→0.50, 10dB→0.30, 15dB→0.15, 20dB→0.07, 25dB→0.03
-   - Quality constraint now meaningful: satisfied only at 20-25dB
-   - File: code/channel/sim_channel.py
-
-3. Message feature consistency (Issue 7.7)
-   - Fixed data_size normalization: clamp(data_size / 10e6, 0, 1) instead of batch min-max
-   - Standardized features: [data_size_norm, semantic_type, delay_urgency, quality_req]
-   - Identical computation in training and evaluation
-   - File: code/hdm/csc_graph_builder.py
-
-4. CSCQI delay emphasis + intent adjustment
-   - w_tau=0.7, w_vartheta=0.3 (delay 70% of reward signal)
-   - Added delay penalty when tau_S > tau_S_int
-   - Eq. 19-20 intent adjustment for high-traffic scenarios
-   - Files: code/evaluation/cscqi.py, code/hdm/hdm_trainer.py, code/channel/sim_channel.py
-
+KNOWN GAPS:
+ISR: 79-94% vs paper 90% — environment calibration dependent
+Delay: HDM 14-70% slower than baselines (paper claims -33.4% reduction)
+Actor loss: ELBO-based Eq. 33 working (non-zero gradients)
