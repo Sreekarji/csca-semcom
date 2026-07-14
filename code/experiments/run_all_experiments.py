@@ -120,6 +120,54 @@ def load_trained_hdm(n_tasks=5, n_relays=5, device=DEVICE):
     return han, hdm
 
 
+def load_trained_mlp(n_tasks=5, n_relays=5, device=DEVICE):
+    """Load best available HAN+MLP checkpoint."""
+    from mlp_policy import MLPActor
+    action_dim = n_tasks + n_tasks * n_relays + n_tasks * 3
+
+    han = HANNetwork(
+        hidden_channels=256, num_heads=8, num_layers=3,
+        n_cscas=n_tasks, n_relays=n_relays,
+        n_messages=n_tasks, n_base_stations=n_tasks,
+    ).to(device)
+
+    mlp = MLPActor(
+        graph_emb_dim=256, task_emb_dim=256,
+        action_dim=action_dim, hidden_dim=256,
+        n_tasks=n_tasks,
+    ).to(device)
+
+    ckpt_candidates = [
+        os.path.join(CKPT_DIR, "mlp_best.pt"),
+        os.path.join(CKPT_DIR, "mlp_ep100.pt"),
+        os.path.join(CKPT_DIR, "mlp_ep200.pt"),
+        os.path.join(CKPT_DIR, "mlp_ep300.pt"),
+        os.path.join(CKPT_DIR, "mlp_ep400.pt"),
+        os.path.join(CKPT_DIR, "mlp_ep500.pt"),
+    ]
+
+    loaded = False
+    for ckpt_path in ckpt_candidates:
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            try:
+                han.load_state_dict(ckpt["han"])
+                mlp.load_state_dict(ckpt["actor"])
+                log(f"[load_trained_mlp] Loaded: {ckpt_path}")
+                loaded = True
+                break
+            except Exception as e:
+                log(f"[load_trained_mlp] Failed to load {ckpt_path}: {e}")
+                continue
+
+    if not loaded:
+        log("[load_trained_mlp] WARNING: No checkpoint loaded -- using random weights")
+
+    han.eval()
+    mlp.eval()
+    return han, mlp
+
+
 def load_trained_baseline(name: str, action_dim: int, device=DEVICE):
     """Load trained baseline checkpoint."""
     import torch.nn as nn
@@ -282,11 +330,12 @@ def experiment_isr_vs_tasks(use_high_pressure=True):
     n_episodes = 50
 
     han_trained, hdm_trained = load_trained_hdm(n_tasks=5, n_relays=5, device=DEVICE)
+    han_mlp, mlp_trained = load_trained_mlp(n_tasks=5, n_relays=5, device=DEVICE)
     sac_actor = load_trained_baseline("SAC", 45, DEVICE)
     ac_actor = load_trained_baseline("AC", 45, DEVICE)
     ppo_actor = load_trained_baseline("PPO", 45, DEVICE)
 
-    results = {m: [] for m in ["HDM", "SAC", "AC", "PPO", "Static"]}
+    results = {m: [] for m in ["HDM", "HAN+MLP", "SAC", "AC", "PPO", "Static"]}
 
     for tasks_per_csca in tasks_per_csca_list:
         EnvClass = HighPressureEnvironment if use_high_pressure else MultiCSCAEnvironment
@@ -299,13 +348,21 @@ def experiment_isr_vs_tasks(use_high_pressure=True):
                 state = env.generate_state()
                 graph_emb, _, msg_embs = han_trained.encode_state(state)
 
-                for name, model in [("HDM", hdm_trained), ("SAC", sac_actor),
-                                     ("AC", ac_actor), ("PPO", ppo_actor)]:
+                for name, model, han_model in [
+                    ("HDM", hdm_trained, han_trained),
+                    ("HAN+MLP", mlp_trained, han_mlp),
+                    ("SAC", sac_actor, han_trained),
+                    ("AC", ac_actor, han_trained),
+                    ("PPO", ppo_actor, han_trained),
+                ]:
+                    graph_emb_m, _, msg_embs_m = han_model.encode_state(state)
                     with torch.no_grad():
                         if name == "HDM":
-                            action = model(graph_emb, message_embs=msg_embs)
+                            action = model(graph_emb_m, message_embs=msg_embs_m)
+                        elif name == "HAN+MLP":
+                            action = model(graph_emb_m, message_embs=msg_embs_m)
                         else:
-                            action = model.get_action(graph_emb)
+                            action = model.get_action(graph_emb_m)
                     bw = action[:, :5]
                     relay = action[:, 5:30].reshape(1, 5, 5)
                     mcs = action[:, 30:].reshape(1, 5, 3)
@@ -323,10 +380,10 @@ def experiment_isr_vs_tasks(use_high_pressure=True):
         for name in results:
             results[name].append(float(np.mean(ep_isrs[name])))
         log(f"  tasks_per_csca={tasks_per_csca} (total={tasks_per_csca*5}): "
-            f"HDM={results['HDM'][-1]:.3f}, SAC={results['SAC'][-1]:.3f}")
+            f"HDM={results['HDM'][-1]:.3f}, HAN+MLP={results['HAN+MLP'][-1]:.3f}, SAC={results['SAC'][-1]:.3f}")
 
     plt.figure(figsize=(8, 5))
-    styles = {"HDM": "b-o", "SAC": "r-s", "AC": "g-^", "PPO": "m-D", "Static": "k--x"}
+    styles = {"HDM": "b-o", "HAN+MLP": "c-^", "SAC": "r-s", "AC": "g-^", "PPO": "m-D", "Static": "k--x"}
     for name, style in styles.items():
         plt.plot(total_tasks_list, results[name], style, label=name, markersize=5)
     plt.xlabel("Total Number of Tasks (5 CSCAs x tasks_per_CSCA)")
@@ -340,9 +397,9 @@ def experiment_isr_vs_tasks(use_high_pressure=True):
 
     save_csv(
         os.path.join(RESULTS, "fig9a_isr_vs_tasks.csv"),
-        [[total_tasks_list[i]] + [results[m][i] for m in ["HDM", "SAC", "AC", "PPO", "Static"]]
+        [[total_tasks_list[i]] + [results[m][i] for m in ["HDM", "HAN+MLP", "SAC", "AC", "PPO", "Static"]]
          for i in range(len(tasks_per_csca_list))],
-        ["total_tasks", "HDM", "SAC", "AC", "PPO", "Static"]
+        ["total_tasks", "HDM", "HAN+MLP", "SAC", "AC", "PPO", "Static"]
     )
     log("Experiment 1 complete.")
     return results
@@ -559,6 +616,7 @@ def generate_summary_table(use_high_pressure=True):
     set_seed(42)
     log("Generating summary table (3 seeds x 200 episodes)...")
     han, hdm = load_trained_hdm(n_tasks=5, n_relays=5)
+    han_mlp, mlp = load_trained_mlp(n_tasks=5, n_relays=5)
     sac = load_trained_baseline("SAC", 45, DEVICE)
     ac = load_trained_baseline("AC", 45, DEVICE)
     ppo = load_trained_baseline("PPO", 45, DEVICE)
@@ -568,6 +626,7 @@ def generate_summary_table(use_high_pressure=True):
 
     methods = [
         ("HDM (trained)", hdm.forward, han),
+        ("HAN+MLP", mlp.forward, han_mlp),
         ("SAC", sac.get_action, han),
         ("AC", ac.get_action, han),
         ("PPO", ppo.get_action, han),
