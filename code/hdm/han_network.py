@@ -94,8 +94,18 @@ class HANNetwork(nn.Module):
                     x_dict_current[nt] = self.norm(x_dict_new[nt])
             
             # Collect this layer's graph embedding (Eq. 26)
-            layer_all_embs = torch.cat([x_dict_current[nt] for nt in x_dict_current], dim=0)
-            layer_graph_emb = layer_all_embs.mean(dim=0, keepdim=True)
+            # Focus on message + csca nodes (not all 21 nodes)
+            focused_embs = []
+            if "message" in x_dict_current and x_dict_current["message"] is not None:
+                focused_embs.append(x_dict_current["message"])
+            if "csca" in x_dict_current and x_dict_current["csca"] is not None:
+                focused_embs.append(x_dict_current["csca"])
+            if focused_embs:
+                layer_focused = torch.cat(focused_embs, dim=0)
+                layer_graph_emb = layer_focused.mean(dim=0, keepdim=True)
+            else:
+                layer_all_embs = torch.cat([x_dict_current[nt] for nt in x_dict_current], dim=0)
+                layer_graph_emb = layer_all_embs.mean(dim=0, keepdim=True)
             layer_embeddings.append(layer_graph_emb)
 
         # Weighted sum across layers (Eq. 26: GL_t = sum w_l * H_l)

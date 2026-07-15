@@ -12,7 +12,7 @@ from cscqi import compute_isr, compute_cscqi
 class SACBaseline:
     """Soft Actor-Critic baseline (paper's comparison method)."""
 
-    def __init__(self, state_dim=128, action_dim=45, device=None):
+    def __init__(self, action_dim=45, device=None, state_dim=256):
         self.device = torch.device(
             device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         )
@@ -38,7 +38,7 @@ class SACBaseline:
 class ACBaseline:
     """Standard Actor-Critic baseline."""
 
-    def __init__(self, state_dim=128, action_dim=45, device=None):
+    def __init__(self, action_dim=45, device=None, state_dim=256):
         self.device = torch.device(
             device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         )
@@ -56,7 +56,7 @@ class ACBaseline:
 class PPOBaseline:
     """PPO baseline."""
 
-    def __init__(self, state_dim=128, action_dim=45, device=None):
+    def __init__(self, action_dim=45, device=None, state_dim=256):
         self.device = torch.device(
             device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         )

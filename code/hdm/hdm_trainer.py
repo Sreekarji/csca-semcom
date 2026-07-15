@@ -452,36 +452,31 @@ class HDMTrainer:
         nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
         self.opt_critic.step()
 
-        # === ACTOR UPDATE — Eq. 33 with HAN gradients ===
-        # Step 1: Get action AND log_prob from DDPM trajectory (with gradients)
-        # Use first graph embedding from batch as representative
-        single_graph_emb = graph_embs[0:1]  # [1, 256]
-        a_0_single, log_prob_single = self.actor.collect_trajectory(
-            single_graph_emb
-        )
+        # === ACTOR UPDATE — Per-sample Eq. 33 ===
+        # Get log_prob for multiple batch samples
+        n_samples = min(8, graph_embs.shape[0])
+        batch_log_probs = []
+        for i in range(n_samples):
+            _, lp = self.actor.collect_trajectory(graph_embs[i:i+1])
+            batch_log_probs.append(lp)
+        log_probs_stacked = torch.cat(batch_log_probs, dim=0)  # [n_samples, 1]
 
-        # Step 2: Get batch actions for advantage estimation (no gradient needed)
+        # Advantage estimation
         with torch.no_grad():
-            new_actions_b = self.actor(graph_embs[:min(16, graph_embs.shape[0])])
-
-        # Step 3: Q-value for advantage estimation — NO detach on state
-        q_values_b = self.critic(
-            graph_embs[:min(16, graph_embs.shape[0])],  # HAN gets gradients
-            new_actions_b.detach()
-        )
-        rewards_b = rewards[:min(16, rewards.shape[0])]
+            new_actions_b = self.actor(graph_embs[:n_samples])
+        q_values_b = self.critic(graph_embs[:n_samples], new_actions_b.detach())
+        rewards_b = rewards[:n_samples]
         advantage_b = rewards_b - q_values_b.detach()
 
-        # Normalize advantage
+        # Normalize per-sample
         adv_mean = advantage_b.mean()
         adv_std = advantage_b.std() + 1e-8
         advantage_norm = ((advantage_b - adv_mean) / adv_std).clamp(-3.0, 3.0)
 
-        # Step 4: Eq. 33 actor loss — log_pi * advantage
-        advantage_scalar = advantage_norm.mean()
-        actor_loss = -(log_prob_single * advantage_scalar).mean()
+        # Per-sample product THEN mean — correct Eq. 33
+        actor_loss = -(log_probs_stacked * advantage_norm).mean()
 
-        # Sanity check — fallback to DDPG if loss explodes
+        # Sanity check — fallback if loss explodes
         if actor_loss.abs() > 50.0 or torch.isnan(actor_loss):
             action_new = self.actor(graph_embs, message_embs=None)
             q_value = self.critic(graph_embs.detach(), action_new)
@@ -596,8 +591,8 @@ if __name__ == "__main__":
     print("Gradient check passed.")
 
     # Full training
-    print("Starting 500 episode training...")
-    rewards = trainer.train(max_episodes=500, checkpoint_every=100)
+    print("Starting 1000 episode training...")
+    rewards = trainer.train(max_episodes=1000, checkpoint_every=100)
 
     # Training curve plot
     smoothed = np.convolve(rewards, np.ones(20)/20, mode='valid')

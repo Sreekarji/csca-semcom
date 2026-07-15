@@ -75,7 +75,7 @@ class CSCGraphBuilder:
             data_sizes = torch.tensor(
                 SCt.get("data_sizes", [1e6] * n_m), dtype=torch.float
             )
-            data_sizes_norm = torch.clamp(data_sizes / 10e6, 0.0, 1.0)
+            data_sizes_norm = torch.clamp(data_sizes / 5e5, 0.0, 1.0)
 
             # Build message features with REAL intent vectors if provided
             if intent_vectors is not None:
@@ -117,23 +117,23 @@ class CSCGraphBuilder:
         data["base_station"].x = bs_feats
         data["init"].x = init_feat
 
-        # csca -> base_station
+        # csca -> base_station (randomized each episode)
         csca_idx = torch.arange(n_c)
-        bs_idx = torch.arange(n_c) % n_b
+        bs_idx = torch.randperm(n_b)[:n_c] if n_b >= n_c else torch.randint(0, n_b, (n_c,))
         data["csca", "comm_conn", "base_station"].edge_index = torch.stack(
             [csca_idx, bs_idx], dim=0
         )
 
-        # message -> csca
+        # message -> csca (randomized each episode)
         msg_idx = torch.arange(n_m)
-        csca_assign = torch.arange(n_m) % n_c
+        csca_assign = torch.randperm(n_c)[:n_m] if n_c >= n_m else torch.randint(0, n_c, (n_m,))
         data["message", "comm_req", "csca"].edge_index = torch.stack(
             [msg_idx, csca_assign], dim=0
         )
 
-        # message -> relay
+        # message -> relay (randomized each episode)
         msg_idx2 = torch.arange(n_m)
-        relay_assign = torch.arange(n_m) % n_r
+        relay_assign = torch.randperm(n_r)[:n_m] if n_r >= n_m else torch.randint(0, n_r, (n_m,))
         data["message", "semantic_conn", "relay"].edge_index = torch.stack(
             [msg_idx2, relay_assign], dim=0
         )

@@ -169,22 +169,31 @@ class MLPTrainer:
         # Actor: generate action
         action = self.actor(graph_emb, message_embs=message_embs)
 
-        # Environment step
-        result = self.env.step(action.detach().cpu().numpy()[0])
-        reward_cscqi = compute_cscqi(
-            delays=result['delays'],
-            distortions=result['distortions'],
-            delay_intents=system_state['SCt']['delay_intents'],
-            quality_intents=system_state['SCt']['quality_intents'],
-        )
-        isr = compute_isr(
-            delays=result['delays'],
-            distortions=result['distortions'],
-            delay_intents=system_state['SCt']['delay_intents'],
-            quality_intents=system_state['SCt']['quality_intents'],
-        )
+        # Parse action into dict format expected by environment
+        action_np = action.detach().cpu().numpy()[0]
+        bw = action_np[:self.n_tasks]
+        relay = action_np[self.n_tasks:self.n_tasks + self.n_tasks * self.n_relays].reshape(1, self.n_tasks, self.n_relays)
+        mcs = action_np[self.n_tasks + self.n_tasks * self.n_relays:].reshape(1, self.n_tasks, self.n_mcs)
+        parsed_action = {
+            "bandwidth": bw.reshape(1, self.n_tasks),
+            "relay": relay,
+            "mcs": mcs,
+        }
 
-        reward_t = float(np.clip(reward_cscqi, -5.0, 5.0))
+        # Environment step
+        result = self.env.step(parsed_action, system_state)
+        tasks = result["tasks"]
+
+        # Compute CSCQI reward (Eq. 17)
+        cscqi_values = []
+        for t in tasks:
+            cscqi_values.append(compute_cscqi(
+                t["tau_S"], t["vartheta_S"],
+                t["tau_S_int"], t["vartheta_S_int"],
+                w_tau=0.5, w_vartheta=0.5,
+            ))
+        reward_t = float(np.clip(np.mean(cscqi_values), -5.0, 5.0))
+        isr = compute_isr(tasks)
 
         # Critic update
         value_pred = self.critic(graph_emb.detach(), action.detach())

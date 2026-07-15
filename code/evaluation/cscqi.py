@@ -39,10 +39,6 @@ def compute_cscqi(
     delay_score = (TAU_MAX - tau_S) / max(TAU_MAX - tau_S_int, 1e-8)
     quality_score = (VARTHETA_MAX - vartheta_S) / max(VARTHETA_MAX - vartheta_S_int, 1e-8)
     cscqi = w_tau * delay_score + w_vartheta * quality_score
-    # Delay penalty: extra penalty when actual delay exceeds intent
-    if tau_S > tau_S_int and tau_S_int > 0:
-        delay_penalty = -2.0 * (tau_S - tau_S_int) / max(tau_S_int, 1e-6)
-        cscqi += delay_penalty
     return cscqi
 
 
