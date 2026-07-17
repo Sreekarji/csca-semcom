@@ -59,9 +59,22 @@ class MLPDenoiser(nn.Module):
 
         # Task-specific bandwidth allocation
         if message_embs is not None:
-            # message_embs: [n_tasks, 128]
-            t_emb_expanded = t_emb.expand(message_embs.shape[0], -1)
-            task_input = torch.cat([message_embs, t_emb_expanded], dim=-1)
+            # Average message embeddings across tasks sharing same CSCA
+            # message_embs: [n_total_tasks, 256] — reduce to [n_tasks, 256]
+            n_total = message_embs.shape[0]
+            if n_total != self.n_tasks:
+                # Group tasks by CSCA and average embeddings
+                tasks_per_csca = n_total // self.n_tasks
+                if tasks_per_csca > 0 and n_total % self.n_tasks == 0:
+                    msg_grouped = message_embs.view(self.n_tasks, tasks_per_csca, -1).mean(dim=1)
+                else:
+                    # Fallback: interpolate to n_tasks
+                    msg_grouped = message_embs[:self.n_tasks] if n_total >= self.n_tasks else \
+                                  message_embs.mean(dim=0, keepdim=True).expand(self.n_tasks, -1)
+            else:
+                msg_grouped = message_embs
+            t_emb_expanded = t_emb.expand(msg_grouped.shape[0], -1)
+            task_input = torch.cat([msg_grouped, t_emb_expanded], dim=-1)
             bw_noise = self.task_bw_head(task_input).T  # [1, n_tasks]
         else:
             bw_noise = a_n[:, :self.n_tasks]
@@ -160,22 +173,23 @@ class HDMPolicy(nn.Module):
                     a_n = mu
             a_0 = torch.sigmoid(a_n)
 
-        # Step 2: Recompute log_prob WITH gradients at mid-point
-        noise_input = torch.randn_like(a_0)
-        n_eval = self.N // 2
-        alpha_bar_eval = self.alphas_cumprod[n_eval - 1]
-
-        a_noisy = torch.sqrt(alpha_bar_eval) * a_0.detach() + \
-                   torch.sqrt(1 - alpha_bar_eval) * noise_input
-
-        pred_noise_eval = self.denoiser(
-            a_noisy, n_eval, graph_emb, message_embs=message_embs
-        )
-
-        log_prob = -0.5 * torch.mean(
-            (noise_input - pred_noise_eval) ** 2,
-            dim=-1, keepdim=True
-        )
+        # Step 2: Recompute log_prob WITH gradients at ALL timesteps
+        log_prob = torch.zeros(batch_size, 1, device=device)
+        for t in range(1, self.N + 1):
+            alpha_bar_t = self.alphas_cumprod[t - 1]
+            eps_t = torch.randn_like(a_0)
+            a_t = torch.sqrt(alpha_bar_t) * a_0.detach() + \
+                  torch.sqrt(1 - alpha_bar_t) * eps_t
+            pred_eps_t = self.denoiser(
+                a_t, t, graph_emb,
+                message_embs=message_embs if message_embs is None or
+                message_embs.shape[0] == self.n_tasks else None
+            )
+            log_prob = log_prob - 0.5 * torch.mean(
+                (eps_t - pred_eps_t) ** 2, dim=-1, keepdim=True
+            )
+        log_prob = log_prob / self.N
+        log_prob = log_prob * 0.1  # scale down to prevent gradient explosion
 
         return a_0, log_prob
 

@@ -6,7 +6,7 @@ os.environ["SENTENCE_TRANSFORMERS_HOME"] = r"D:\MP2\models"
 import numpy as np
 
 # Paper's parameter settings (Table II)
-TAU_MAX = 10.0       # Maximum delay in seconds
+TAU_MAX = 2.0        # Maximum delay in seconds
 VARTHETA_MAX = 1.0   # Maximum distortion (normalized)
 W_TAU = 0.5          # Delay weight (equal weights per paper)
 W_VARTHETA = 0.5     # Quality weight
@@ -36,10 +36,13 @@ def compute_cscqi(
     w_tau: float = W_TAU,
     w_vartheta: float = W_VARTHETA,
 ) -> float:
+    # Eq. 17: normalize relative to intent, not absolute TAU_MAX
+    # This makes CSCQI sensitive to whether intent was met or not
     delay_score = (TAU_MAX - tau_S) / max(TAU_MAX - tau_S_int, 1e-8)
     quality_score = (VARTHETA_MAX - vartheta_S) / max(VARTHETA_MAX - vartheta_S_int, 1e-8)
     cscqi = w_tau * delay_score + w_vartheta * quality_score
-    return cscqi
+    # Clip to reasonable range — paper reports positive values
+    return float(np.clip(cscqi, -5.0, 5.0))
 
 
 def compute_isr(tasks: list) -> float:

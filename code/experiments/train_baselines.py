@@ -186,8 +186,10 @@ def train_ppo(n_episodes=2000):
             value = critic(graph_det)
             advantage = (reward - value.detach())
 
-            ratio = (new_action / (old_action.detach() + 1e-8))
-            ratio = ratio.mean(dim=-1, keepdim=True)
+            # Proper log-prob ratio using Gaussian log-likelihood approximation
+            log_prob_new = -0.5 * ((new_action - 0.5) ** 2).sum(dim=-1, keepdim=True)
+            log_prob_old = -0.5 * ((old_action.detach() - 0.5) ** 2).sum(dim=-1, keepdim=True)
+            ratio = torch.exp(log_prob_new - log_prob_old).clamp(0.05, 20.0)
 
             surr1 = ratio * advantage
             surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantage
@@ -254,7 +256,9 @@ def train_ac(n_episodes=2000):
         opt_c.step()
 
         action_new = actor(graph_emb.detach())
-        a_loss = -(advantage * action_new.mean(dim=-1, keepdim=True)).mean()
+        # Proper policy gradient: use log-prob as surrogate
+        log_prob = -0.5 * ((action_new - 0.5) ** 2).sum(dim=-1, keepdim=True)
+        a_loss = -(advantage * log_prob).mean()
         opt_a.zero_grad()
         a_loss.backward()
         opt_a.step()

@@ -48,3 +48,6 @@ temp_*
 paper_full_text.txt
 all-MiniLM-L6-v2/
 repos/
+deepmimo_scenarios/
+*.zip
+deepmimo_test.py

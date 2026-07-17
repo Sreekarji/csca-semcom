@@ -276,13 +276,16 @@ def run_method_episodes_averaged(
 
         for ep in range(n_episodes):
             state = env.generate_state()
-            graph_emb, _, _ = han.encode_state(state)
+            graph_emb, _, msg_embs = han.encode_state(state)
 
             n_r = env.n_relays
             n_mcs = env.n_mcs
 
             with torch.no_grad():
-                action_raw = get_action_fn(graph_emb)
+                try:
+                    action_raw = get_action_fn(graph_emb, message_embs=msg_embs)
+                except TypeError:
+                    action_raw = get_action_fn(graph_emb)
 
             parsed = parse_action(action_raw, n_tasks, n_r, n_mcs)
 
@@ -431,7 +434,7 @@ def experiment_delay_vs_sinr():
                     with torch.no_grad():
                         action_raw = fn(graph_emb) if method == "HDM" else static.get_action(graph_emb)
                     parsed = parse_action(action_raw, 5, 5, 3)
-                    result = env.step(parsed, state)
+                    result = env.step(parsed, state, target_snr_db=snr)
                     avg_d = np.mean([t["tau_S"] for t in result["tasks"]])
                     if method == "HDM":
                         h_d.append(avg_d)
@@ -509,34 +512,28 @@ def experiment_ablation(use_high_pressure=False):
     results = {m: {"isr": [], "isr_std": []} for m in ["HDM", "HDM-no-HAN", "HDM-no-DDPM"]}
 
     for n in task_counts:
-        action_dim = n + n * 5 + n * 3
-        han_n = HANNetwork(hidden_channels=256, num_heads=8, num_layers=3,
-                           n_cscas=n, n_relays=5, n_messages=n, n_base_stations=n).to(DEVICE)
+        tasks_per_csca = n
 
-        if use_high_pressure:
-            def env_fn(n=n): return HighPressureEnvironment(n_cscas=n, n_relays=5)
-        else:
-            def env_fn(n=n): return MultiCSCAEnvironment(n_cscas=n, n_relays=5, difficulty="hard")
+        def make_env(tpc=tasks_per_csca):
+            return MultiCSCAEnvironment(
+                n_cscas=5, n_relays=5, difficulty="hard",
+                tasks_per_csca=tpc
+            )
 
-        if n == 5:
-            r = run_method_episodes_averaged("HDM", hdm.forward, env_fn, han,
-                                             n_episodes=200, n_seeds=3, n_tasks=5)
-        else:
-            hdm_n = HDMPolicy(action_dim=action_dim).to(DEVICE)
-            r = run_method_episodes_averaged("HDM", hdm_n.forward, env_fn, han_n,
-                                             n_episodes=200, n_seeds=3, n_tasks=n)
+        r = run_method_episodes_averaged("HDM", hdm.forward, make_env, han,
+                                         n_episodes=200, n_seeds=3, n_tasks=5)
         results["HDM"]["isr"].append(r["isr"])
         results["HDM"]["isr_std"].append(r["isr_std"])
 
-        no_han = StaticBaseline(action_dim=action_dim, device=DEVICE)
-        r = run_method_episodes_averaged("HDM-no-HAN", no_han.get_action, env_fn, han_n,
-                                         n_episodes=200, n_seeds=3, n_tasks=n)
+        no_han = StaticBaseline(action_dim=45, device=DEVICE)
+        r = run_method_episodes_averaged("HDM-no-HAN", no_han.get_action, make_env, han,
+                                         n_episodes=200, n_seeds=3, n_tasks=5)
         results["HDM-no-HAN"]["isr"].append(r["isr"])
         results["HDM-no-HAN"]["isr_std"].append(r["isr_std"])
 
         no_ddpm = load_trained_baseline("SAC", 45, DEVICE)
-        r = run_method_episodes_averaged("HDM-no-DDPM", no_ddpm.get_action, env_fn, han_n,
-                                         n_episodes=200, n_seeds=3, n_tasks=n)
+        r = run_method_episodes_averaged("HDM-no-DDPM", no_ddpm.get_action, make_env, han,
+                                         n_episodes=200, n_seeds=3, n_tasks=5)
         results["HDM-no-DDPM"]["isr"].append(r["isr"])
         results["HDM-no-DDPM"]["isr_std"].append(r["isr_std"])
 

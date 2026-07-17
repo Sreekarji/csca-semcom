@@ -119,21 +119,35 @@ class HANNetwork(nn.Module):
         """
         Encode system state into graph embedding + per-message embeddings.
         intent_vectors: list of [delay_urgency, quality_req] per task.
-        Returns: graph_emb [1, 128], node_embs dict, message_embs [n_tasks, 128]
+        Returns: graph_emb [1, 256], node_embs dict, message_embs [n_tasks, 256]
         """
-        data = self.graph_builder.build(
-            system_state, intent_vectors=intent_vectors
-        )
+        # Detect actual number of tasks from system_state
+        if system_state is not None:
+            n_tasks_actual = len(system_state.get("SCt", {}).get("data_sizes",
+                             [None] * self.graph_builder.n_messages))
+        else:
+            n_tasks_actual = self.graph_builder.n_messages
+
+        # Rebuild graph builder if task count changed
+        if n_tasks_actual != self.graph_builder.n_messages:
+            from csc_graph_builder import CSCGraphBuilder
+            temp_builder = CSCGraphBuilder(
+                n_cscas=self.graph_builder.n_cscas,
+                n_relays=self.graph_builder.n_relays,
+                n_messages=n_tasks_actual,
+                n_base_stations=self.graph_builder.n_bs,
+            )
+            data = temp_builder.build(system_state, intent_vectors=intent_vectors)
+        else:
+            data = self.graph_builder.build(system_state, intent_vectors=intent_vectors)
+
         device = next(self.parameters()).device
         data = data.to(device)
         graph_emb, node_embs = self.forward(data)
 
-        # Return per-message embeddings for task-specific policy
         if "message" in node_embs:
-            message_embs = node_embs["message"]  # [n_messages, 128]
+            message_embs = node_embs["message"]
         else:
-            message_embs = graph_emb.expand(
-                self.graph_builder.n_messages, -1
-            )
+            message_embs = graph_emb.expand(n_tasks_actual, -1)
 
         return graph_emb, node_embs, message_embs

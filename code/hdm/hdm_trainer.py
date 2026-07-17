@@ -15,7 +15,7 @@ sys.path.insert(0, r"D:\MP2\code\evaluation")
 
 from ddpm_policy import HDMPolicy, CriticNetwork
 from han_network import HANNetwork
-from sim_channel import MultiCSCAEnvironment, HighPressureEnvironment
+from sim_channel import MultiCSCAEnvironment
 from cscqi import compute_cscqi, compute_isr
 from shaped_reward import compute_shaped_reward
 
@@ -167,11 +167,11 @@ class HDMTrainer:
             action_dim=action_dim,
         ).to(self.device)
 
-        self.env = HighPressureEnvironment(
+        self.env = MultiCSCAEnvironment(
             n_cscas=n_cscas,
             n_relays=n_relays,
-            n_base_stations=n_cscas,
-            n_mcs=n_mcs,
+            bandwidth_total_hz=5e6,
+            difficulty="hard",
         )
 
         self.opt_actor = optim.Adam(
@@ -201,7 +201,7 @@ class HDMTrainer:
         # Experience replay
         self.replay_buffer = ReplayBuffer(capacity=10000)
         self.batch_size = 256
-        self.min_buffer_size = 64
+        self.min_buffer_size = 10
 
         self.reward_history = []
         self.cscqi_history = []
@@ -300,10 +300,16 @@ class HDMTrainer:
         states = batch["state"]
         actions = batch["action"]
         rewards = batch["reward"]
+        next_states = batch["next_state"]
 
-        # === CRITIC UPDATE on batch ===
+        # === CRITIC UPDATE on batch — TD bootstrapping ===
+        with torch.no_grad():
+            next_actions = self.actor(next_states)
+            next_values = self.critic(next_states, next_actions)
+            targets = rewards + self.gamma * next_values
+
         value_pred = self.critic(states, actions)
-        critic_loss = nn.MSELoss()(value_pred, rewards)
+        critic_loss = nn.MSELoss()(value_pred, targets.detach())
 
         self.opt_critic.zero_grad()
         critic_loss.backward()
@@ -340,7 +346,7 @@ class HDMTrainer:
         actor_loss = -(log_prob_new * advantage_norm).mean()
 
         # Sanity check — if loss explodes, fall back to DDPG
-        if actor_loss.abs() > 10.0:
+        if actor_loss.abs() > 50.0:
             actor_loss = -value_est.mean()
 
         self.opt_actor.zero_grad()
@@ -592,7 +598,7 @@ if __name__ == "__main__":
 
     # Full training
     print("Starting 1000 episode training...")
-    rewards = trainer.train(max_episodes=1000, checkpoint_every=100)
+    rewards = trainer.train(max_episodes=200, checkpoint_every=100)
 
     # Training curve plot
     smoothed = np.convolve(rewards, np.ones(20)/20, mode='valid')

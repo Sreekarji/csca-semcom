@@ -331,8 +331,9 @@ class MultiCSCAEnvironment:
         n_relays: int          = 5,
         n_base_stations: int   = 5,
         n_mcs: int             = 3,
-        bandwidth_total_hz: float = 20e6,
+        bandwidth_total_hz: float = 5e6,
         difficulty: str        = "hard",
+        tasks_per_csca: int    = 1,
     ):
         self.n_cscas         = n_cscas
         self.n_relays        = n_relays
@@ -340,6 +341,8 @@ class MultiCSCAEnvironment:
         self.n_mcs           = n_mcs
         self.bandwidth_total = bandwidth_total_hz
         self.difficulty      = difficulty
+        self.tasks_per_csca  = tasks_per_csca
+        self.n_tasks         = n_cscas * tasks_per_csca
 
         # Per-CSCA channel object — bandwidth updated each step
         self.channel = WirelessChannel(bandwidth_hz=bandwidth_total_hz / n_cscas)
@@ -384,22 +387,22 @@ class MultiCSCAEnvironment:
         }
 
         if self.difficulty == "hard":
-            delay_intents   = np.random.uniform(0.05, 1.0, self.n_cscas).tolist()
-            quality_intents = np.random.uniform(0.90, 1.00, self.n_cscas).tolist()
-            data_sizes      = (np.random.rand(self.n_cscas) * 0.4e6 + 0.1e6).tolist()
+            delay_intents   = np.random.uniform(0.2, 0.6, self.n_tasks).tolist()
+            quality_intents = np.random.uniform(0.50, 0.70, self.n_tasks).tolist()
+            data_sizes      = (np.random.rand(self.n_tasks) * 0.2e6 + 0.1e6).tolist()
         elif self.difficulty == "medium":
-            delay_intents   = np.random.uniform(0.05, 1.0, self.n_cscas).tolist()
-            quality_intents = np.random.uniform(0.90, 1.00, self.n_cscas).tolist()
-            data_sizes      = (np.random.rand(self.n_cscas) * 0.4e6 + 0.1e6).tolist()
+            delay_intents   = np.random.uniform(0.5, 1.2, self.n_tasks).tolist()
+            quality_intents = np.random.uniform(0.55, 0.75, self.n_tasks).tolist()
+            data_sizes      = (np.random.rand(self.n_tasks) * 0.2e6 + 0.1e6).tolist()
         else:  # easy
-            delay_intents   = np.random.uniform(0.05, 1.0, self.n_cscas).tolist()
-            quality_intents = np.random.uniform(0.90, 1.00, self.n_cscas).tolist()
-            data_sizes      = (np.random.rand(self.n_cscas) * 0.4e6 + 0.1e6).tolist()
+            delay_intents   = np.random.uniform(0.6, 1.5, self.n_tasks).tolist()
+            quality_intents = np.random.uniform(0.60, 0.80, self.n_tasks).tolist()
+            data_sizes      = (np.random.rand(self.n_tasks) * 0.2e6 + 0.1e6).tolist()
 
         # Message features encode real task information for CSC graph
         msg_feats = []
-        for i in range(self.n_cscas):
-            ds_norm = min(data_sizes[i] / 1e7, 1.0)
+        for i in range(self.n_tasks):
+            ds_norm = min(data_sizes[i] / 5e5, 1.0)
             di      = delay_intents[i] / 5.0
             qi      = quality_intents[i]
             urgency = (1.0 - di) * 0.5 + (1.0 - qi) * 0.5
@@ -431,13 +434,13 @@ class MultiCSCAEnvironment:
                 "relays": self.relay_positions,
             },
         }
-        data_sizes = (np.random.rand(self.n_cscas) * (data_max - data_min) + data_min).tolist()
-        delay_intents = (np.random.rand(self.n_cscas) * (delay_max - delay_min) + delay_min).tolist()
-        quality_intents = (np.random.rand(self.n_cscas) * (quality_max - quality_min) + quality_min).tolist()
+        data_sizes = (np.random.rand(self.n_tasks) * (data_max - data_min) + data_min).tolist()
+        delay_intents = (np.random.rand(self.n_tasks) * (delay_max - delay_min) + delay_min).tolist()
+        quality_intents = (np.random.rand(self.n_tasks) * (quality_max - quality_min) + quality_min).tolist()
 
         msg_feats = []
-        for i in range(self.n_cscas):
-            ds_norm = min(data_sizes[i] / 1e7, 1.0)
+        for i in range(self.n_tasks):
+            ds_norm = min(data_sizes[i] / 5e5, 1.0)
             di = delay_intents[i] / 5.0
             qi = quality_intents[i]
             urgency = (1.0 - di) * 0.5 + (1.0 - qi) * 0.5
@@ -483,12 +486,12 @@ class MultiCSCAEnvironment:
         # Apply intent adjustment for high-traffic scenarios (Eq. 19-20)
         # When more than 70% of tasks are competing (high traffic),
         # adjust intents to be more realistic
-        n_competing = self.n_cscas
+        n_competing = self.n_tasks
         traffic_load = n_competing / 10.0  # Normalized: >1 = high traffic
 
         if traffic_load > 0.5:
             tau_w = traffic_load - 0.5  # Waiting time proxy
-            for i in range(self.n_cscas):
+            for i in range(self.n_tasks):
                 adjusted_delay, adjusted_quality = adjust_intent(
                     SCt["delay_intents"][i],
                     SCt["quality_intents"][i],
@@ -517,22 +520,32 @@ class MultiCSCAEnvironment:
             float(action["bandwidth"][0, i].item())
             for i in range(self.n_cscas)
         ]
-        bw_allocations = _softmax_bw_allocation(
+        csca_bw = _softmax_bw_allocation(
             raw_logits, self.bandwidth_total, temperature=BW_SOFTMAX_TEMP
         )
-        # bw_allocations[i] is the bandwidth in Hz for CSCA i
-        # Sum is guaranteed to equal self.bandwidth_total
+        # Map CSCA BW to tasks: each CSCA's BW shared among its tasks
+        bw_allocations = []
+        for task_i in range(self.n_tasks):
+            csca_i = task_i % self.n_cscas
+            bw_allocations.append(csca_bw[csca_i] / self.tasks_per_csca)
         # ----------------------------------------------------------------
 
         results = []
-        for i in range(self.n_cscas):
+        for i in range(self.n_tasks):
             bw_alloc = max(bw_allocations[i], 1e3)  # floor at 1 kHz
 
             # TX power scales mildly with BW fraction (unchanged from original)
             bw_frac  = bw_alloc / self.bandwidth_total
             tx_power = 10 + bw_frac * 13
 
-            distance = np.random.uniform(0.3, 2.0)
+            # Use stored CSCA and BS positions instead of random distance
+            csca_pos = self.csca_positions[i % len(self.csca_positions)]
+            bs_pos   = self.bs_positions[i % len(self.bs_positions)]
+            base_dist = float(np.sqrt(
+                (csca_pos[0] - bs_pos[0])**2 + (csca_pos[1] - bs_pos[1])**2
+            ))
+            # Add small random perturbation for channel variation (shadow fading proxy)
+            distance = float(np.clip(base_dist + np.random.normal(0, 0.1), 0.1, 3.0))
 
             # Inter-cell interference from other base stations
             interferer_powers = []
@@ -616,7 +629,8 @@ class HighPressureEnvironment(MultiCSCAEnvironment):
         super().__init__(
             n_cscas=n_cscas, n_relays=n_relays,
             n_base_stations=n_base_stations, n_mcs=n_mcs,
-            bandwidth_total_hz=10e6,  # Scarce bandwidth
+            bandwidth_total_hz=5e6,
+            difficulty="hard",
         )
 
     def generate_state(self) -> dict:
@@ -629,7 +643,7 @@ class HighPressureEnvironment(MultiCSCAEnvironment):
         quality_intents = []
         data_sizes = []
 
-        for i in range(n_c):
+        for i in range(self.n_tasks):
             task_type = i % 3
             if task_type == 0:
                 # URGENT: 3-5MB data, 0.4-0.6s intent, needs ~50%+ BW
@@ -648,8 +662,8 @@ class HighPressureEnvironment(MultiCSCAEnvironment):
                 data_sizes.append(float(np.random.uniform(0.5e6, 2.0e6)))
 
         msg_feats = []
-        for i in range(n_c):
-            ds_norm = min(data_sizes[i] / 1e7, 1.0)
+        for i in range(self.n_tasks):
+            ds_norm = min(data_sizes[i] / 5e5, 1.0)
             di = delay_intents[i] / 5.0
             qi = quality_intents[i]
             urgency = (1.0 - di) * 0.5 + (1.0 - qi) * 0.5

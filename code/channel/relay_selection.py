@@ -221,7 +221,8 @@ def select_relay(
     # If direct link meets quality intent, no relay needed
     # Paper: "When the distortion cannot meet the user's intent,
     #         i.e., theta_A,B > theta_S, it is necessary to select a semantic relay"
-    if distortion_direct <= intent_quality:
+    distortion_threshold = 1.0 - intent_quality
+    if distortion_direct <= distortion_threshold:
         return {
             "relay_needed": False,
             "relay_id": None,
