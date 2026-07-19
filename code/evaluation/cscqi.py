@@ -36,13 +36,24 @@ def compute_cscqi(
     w_tau: float = W_TAU,
     w_vartheta: float = W_VARTHETA,
 ) -> float:
-    # Eq. 17: normalize relative to intent, not absolute TAU_MAX
-    # This makes CSCQI sensitive to whether intent was met or not
-    delay_score = (TAU_MAX - tau_S) / max(TAU_MAX - tau_S_int, 1e-8)
-    quality_score = (VARTHETA_MAX - vartheta_S) / max(VARTHETA_MAX - vartheta_S_int, 1e-8)
-    cscqi = w_tau * delay_score + w_vartheta * quality_score
-    # Clip to reasonable range — paper reports positive values
-    return float(np.clip(cscqi, -5.0, 5.0))
+    # Eq. 17 + Sec V.A.3: hard negative when intent C1 is violated
+    # Paper: "For communication requests whose intent cannot be satisfied,
+    #         we define the reward as a negative value"
+    delay_violated = tau_S > tau_S_int
+    quality_violated = vartheta_S > vartheta_S_int
+    
+    if delay_violated or quality_violated:
+        # Hard negative: proportional to how badly intent was missed
+        delay_excess = max(0.0, tau_S - tau_S_int) / max(tau_S_int, 1e-8)
+        quality_excess = max(0.0, vartheta_S - vartheta_S_int) / max(vartheta_S_int, 1e-8)
+        violation = w_tau * delay_excess + w_vartheta * quality_excess
+        return float(np.clip(-violation, -5.0, -0.1))  # always negative when violated
+    else:
+        # Eq. 17: satisfied case
+        delay_score = (TAU_MAX - tau_S) / max(TAU_MAX - tau_S_int, 1e-8)
+        quality_score = (VARTHETA_MAX - vartheta_S) / max(VARTHETA_MAX - vartheta_S_int, 1e-8)
+        cscqi = w_tau * delay_score + w_vartheta * quality_score
+        return float(np.clip(cscqi, 0.0, 5.0))
 
 
 def compute_isr(tasks: list) -> float:

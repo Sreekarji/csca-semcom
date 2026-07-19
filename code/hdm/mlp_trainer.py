@@ -124,7 +124,12 @@ class MLPTrainer:
         )
 
         # Environment
-        self.env = MultiCSCAEnvironment(n_cscas=self.n_tasks, n_relays=self.n_relays)
+        self.env = MultiCSCAEnvironment(
+            n_cscas=self.n_tasks,
+            n_relays=self.n_relays,
+            difficulty="medium",
+            tasks_per_csca=1,
+        )
         self.curriculum = CurriculumScheduler()
         self.replay_buffer = MLPReplayBuffer(capacity=10000)
 
@@ -141,7 +146,7 @@ class MLPTrainer:
 
     def _generate_intent_vectors(self):
         intent_vectors = []
-        for _ in range(self.n_tasks):
+        for _ in range(self.env.n_tasks):  # Generate for ALL tasks, not just n_cscas
             urgency = np.random.uniform(0.4, 0.7)
             quality = np.random.uniform(0.4, 0.7)
             intent_vectors.append([urgency, quality])

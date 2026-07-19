@@ -1,53 +1,35 @@
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
+*.pyc
+*.pyo
 .venv/
-venv/
-env/
+*.egg-info/
 
-# Models (too large for GitHub)
+# Checkpoints — only keep best, not every epoch
+results/software/checkpoints/hdm_ep*.pt
+results/software/checkpoints/mlp_ep*.pt
+results/software/checkpoints/sac_*.pt
+results/software/checkpoints/ppo_*.pt
+results/software/checkpoints/ac_*.pt
+
+# Large model files
 models/
-*.gguf
-*.pth
-*.pt
-*.ckpt
-*.safetensors
 *.bin
-*.h5
-*.pkl
-
-# Data
-data/raw/
-data/processed/
-
-# Results (keep plots, skip large files)
-results/software/checkpoints/
-*.csv
+*.safetensors
+all-MiniLM-L6-v2/
 
 # Logs
-*.log
 log.txt
+*.log
 
-# IDE
-.vscode/
-.idea/
-*.swp
+# Archive
+archive/
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Jupyter
-.ipynb_checkpoints/
-
-# Temp files
-temp_*
-paper_full_text.txt
-all-MiniLM-L6-v2/
-repos/
+# Data (too large for GitHub)
+data/raw/
+data/processed/
 deepmimo_scenarios/
-*.zip
-deepmimo_test.py

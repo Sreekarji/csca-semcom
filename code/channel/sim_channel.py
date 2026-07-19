@@ -52,7 +52,7 @@ INTERFERENCE_CELLS = 6          # top-K interferers, Section IV.A.3
 # ---------------------------------------------------------------------------
 # BW allocation constant — controls how sharply HDM output maps to BW
 # ---------------------------------------------------------------------------
-BW_SOFTMAX_TEMP = 1.0   # was 0.3 — too sharp, made softmax near-argmax
+BW_SOFTMAX_TEMP = 0.5   # sharper differentiation: 2x logit diff → 4x BW diff
 
 
 class WirelessChannel:

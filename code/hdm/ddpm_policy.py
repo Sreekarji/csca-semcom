@@ -40,7 +40,7 @@ class MLPDenoiser(nn.Module):
         # Global policy head for relay + MCS
         relay_mcs_dim = action_dim - n_tasks
         self.global_head = nn.Sequential(
-            nn.Linear(action_dim + graph_emb_dim + hidden_dim, hidden_dim),
+            nn.Linear(graph_emb_dim + hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
@@ -88,8 +88,10 @@ class MLPDenoiser(nn.Module):
             else:
                 graph_emb = graph_emb[:a_n.shape[0]]
 
-        global_input = torch.cat([a_n, graph_emb, t_emb], dim=-1)
+        global_input = torch.cat([graph_emb, t_emb], dim=-1)
         relay_mcs_noise = self.global_head(global_input)
+        if relay_mcs_noise.shape[0] != a_n.shape[0]:
+            relay_mcs_noise = relay_mcs_noise.expand(a_n.shape[0], -1)
 
         # Combine
         predicted_noise = torch.cat([bw_noise, relay_mcs_noise], dim=-1)
@@ -117,6 +119,7 @@ class HDMPolicy(nn.Module):
         self.N = n_denoising_steps
         self.beta_min = beta_min
         self.beta_max = beta_max
+        self.n_tasks = n_tasks
 
         self.denoiser = MLPDenoiser(
             action_dim=action_dim,
@@ -149,7 +152,9 @@ class HDMPolicy(nn.Module):
                            message_embs: torch.Tensor = None,
                            batch_size: int = 1):
         """
-        DDPO-SF: Generate action without gradients, then compute log_prob with gradients.
+        Paper-faithful log_prob: Eq. 28-29.
+        Record μ_θ(a_n, n, G^L_t) at each actual denoising step.
+        log π_θ(a_t|s_t) = Σ_{n=1}^{N} log N(a_{n-1}; μ_θ, β̃_n I)
         """
         device = graph_emb.device
         if graph_emb.dim() == 1:
@@ -157,41 +162,59 @@ class HDMPolicy(nn.Module):
         if graph_emb.shape[0] == 1 and batch_size > 1:
             graph_emb = graph_emb.expand(batch_size, -1)
 
-        # Step 1: Generate full trajectory WITHOUT gradients
-        with torch.no_grad():
-            a_n = torch.randn(batch_size, self.action_dim, device=device)
-            for n in range(self.N, 0, -1):
-                beta_n = self.betas[n - 1]
-                alpha_n = self.alphas[n - 1]
-                alpha_bar_n = self.alphas_cumprod[n - 1]
-                pred_noise = self.denoiser(a_n, n, graph_emb, message_embs=message_embs)
-                coeff = beta_n / torch.sqrt(1.0 - alpha_bar_n)
-                mu = (1.0 / torch.sqrt(alpha_n)) * (a_n - coeff * pred_noise)
-                if n > 1:
-                    a_n = mu + torch.sqrt(beta_n) * torch.randn_like(a_n)
-                else:
-                    a_n = mu
-            a_0 = torch.sigmoid(a_n)
+        # Run full trajectory WITH gradients, recording μ_θ at each step
+        a_n = torch.randn(batch_size, self.action_dim, device=device)
+        
+        mu_list = []
+        a_list = [a_n]  # a_N is the starting point
 
-        # Step 2: Recompute log_prob WITH gradients at ALL timesteps
+        for n in range(self.N, 0, -1):
+            beta_n = self.betas[n - 1]
+            alpha_n = self.alphas[n - 1]
+            alpha_cumprod_n = self.alphas_cumprod[n - 1]
+
+            # Predict noise WITH gradients (so actor loss flows through denoiser)
+            pred_noise = self.denoiser(a_n, n, graph_emb, message_embs=message_embs)
+
+            # Eq. 30: μ_θ(a_n, n, G^L_t)
+            coeff = beta_n / torch.sqrt(1.0 - alpha_cumprod_n)
+            mu = (1.0 / torch.sqrt(alpha_n)) * (a_n - coeff * pred_noise)
+            mu_list.append(mu)
+
+            if n > 1:
+                # Eq. 29: posterior variance β̃_n
+                alpha_cumprod_prev = self.alphas_cumprod[n - 2]
+                beta_tilde_n = (1.0 - alpha_cumprod_prev) / (1.0 - alpha_cumprod_n) * beta_n
+                noise = torch.randn_like(a_n)
+                a_n = mu.detach() + torch.sqrt(beta_tilde_n) * noise
+            else:
+                a_n = mu.detach()
+            a_list.append(a_n)
+
+        a_0 = torch.sigmoid(a_n)
+
+        # Eq. 28-29: log π_θ = Σ_{n=1}^{N} log N(a_{n-1}; μ_θ(a_n,n,G), β̃_n I)
         log_prob = torch.zeros(batch_size, 1, device=device)
-        for t in range(1, self.N + 1):
-            alpha_bar_t = self.alphas_cumprod[t - 1]
-            eps_t = torch.randn_like(a_0)
-            a_t = torch.sqrt(alpha_bar_t) * a_0.detach() + \
-                  torch.sqrt(1 - alpha_bar_t) * eps_t
-            pred_eps_t = self.denoiser(
-                a_t, t, graph_emb,
-                message_embs=message_embs if message_embs is None or
-                message_embs.shape[0] == self.n_tasks else None
-            )
-            log_prob = log_prob - 0.5 * torch.mean(
-                (eps_t - pred_eps_t) ** 2, dim=-1, keepdim=True
-            )
-        log_prob = log_prob / self.N
-        log_prob = log_prob * 0.1  # scale down to prevent gradient explosion
+        for i, (mu_i, beta_i_idx) in enumerate(zip(mu_list, range(self.N - 1, -1, -1))):
+            beta_n = self.betas[beta_i_idx]
+            alpha_cumprod_n = self.alphas_cumprod[beta_i_idx]
+            if beta_i_idx > 0:
+                alpha_cumprod_prev = self.alphas_cumprod[beta_i_idx - 1]
+                beta_tilde_n = (1.0 - alpha_cumprod_prev) / (1.0 - alpha_cumprod_n) * beta_n
+            else:
+                beta_tilde_n = beta_n
+            # a_{n-1} is a_list[i+1]
+            a_prev = a_list[i + 1].detach()
+            # log N(a_{n-1}; μ_i, β̃_n I) = -0.5 * ||a_{n-1} - μ_i||² / β̃_n
+            diff = a_prev - mu_i
+            log_prob_step = -0.5 * (diff ** 2 / (beta_tilde_n + 1e-8)).sum(dim=-1, keepdim=True)
+            log_prob = log_prob + log_prob_step
 
-        return a_0, log_prob
+        # Normalize by both N (steps) and action_dim to keep actor_loss in [-1, 1] range
+        # Without this: log_prob ≈ -19.5, actor_loss ≈ ±58, training oscillates
+        # With this: log_prob ≈ -0.07, actor_loss ≈ ±0.2, training is stable
+        log_prob = log_prob / (self.N * self.action_dim)
+        return a_0.detach(), log_prob
 
     def reverse_diffusion(self, graph_emb: torch.Tensor,
                           message_embs: torch.Tensor = None,

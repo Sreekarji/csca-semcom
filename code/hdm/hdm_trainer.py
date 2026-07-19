@@ -79,41 +79,19 @@ class CurriculumScheduler:
         self.phase = 1
 
     def get_difficulty(self, episode: int) -> str:
-        if episode < 300:
-            return "easy"
-        else:
-            return "medium"
-        # Phase 3 (Hard) permanently disabled - too resource constrained,
-        # degrades training. ep100 was best because it only saw Phase 1.
+        return "medium"  # fixed difficulty, no curriculum shift that breaks training
 
     def get_env_params(self, episode: int) -> dict:
-        difficulty = self.get_difficulty(episode)
-        if difficulty == "easy":
-            return {
-                "delay_range": (1.0, 5.0),
-                "quality_range": (0.2, 0.6),
-                "data_size_range": (1e5, 5e5),
-                "distance_range": (0.05, 0.2),
-            }
-        elif difficulty == "medium":
-            return {
-                "delay_range": (0.5, 3.0),
-                "quality_range": (0.4, 0.8),
-                "data_size_range": (5e5, 2e6),
-                "distance_range": (0.1, 0.5),
-            }
-        else:  # hard
-            return {
-                "delay_range": (0.1, 1.5),
-                "quality_range": (0.6, 0.95),
-                "data_size_range": (1e6, 5e6),
-                "distance_range": (0.2, 1.0),
-            }
+        # Fixed medium difficulty — matches the environment's own generate_state()
+        return {
+            "delay_range": (0.5, 1.2),
+            "quality_range": (0.55, 0.75),
+            "data_size_range": (1e5, 3e5),
+            "distance_range": (0.1, 0.5),
+        }
 
     def get_phase_name(self, episode: int) -> str:
-        difficulty = self.get_difficulty(episode)
-        names = {"easy": "Phase 1 (Easy)", "medium": "Phase 2 (Medium)", "hard": "Phase 3 (Hard)"}
-        return names[difficulty]
+        return "Phase 2 (Medium)"
 
 
 class HDMTrainer:
@@ -134,11 +112,15 @@ class HDMTrainer:
         gamma: float = 0.95,
         max_grad_norm: float = 1.0,
         device: str = None,
+        tasks_schedule: list = None,
     ):
         self.device = torch.device(
             device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         )
         self.n_tasks = n_cscas
+        self.n_cscas = n_cscas
+        self.n_relays = n_relays
+        self.tasks_schedule = tasks_schedule or [1]
         self.n_relays = n_relays
         self.n_mcs = n_mcs
         self.gamma = gamma
@@ -171,7 +153,8 @@ class HDMTrainer:
             n_cscas=n_cscas,
             n_relays=n_relays,
             bandwidth_total_hz=5e6,
-            difficulty="hard",
+            difficulty="medium",
+            tasks_per_csca=1,  # avoids graph rebuild mismatch
         )
 
         self.opt_actor = optim.Adam(
@@ -223,7 +206,7 @@ class HDMTrainer:
 
         # Generate diverse intent vectors — mix of urgent and non-urgent
         intent_vectors = []
-        for i in range(self.n_tasks):
+        for i in range(self.env.n_tasks):  # Generate for ALL tasks, not just n_cscas
             if i % 3 == 0:
                 delay_urgency = np.random.uniform(0.7, 1.0)
                 quality_req = np.random.uniform(0.3, 0.6)
@@ -343,10 +326,12 @@ class HDMTrainer:
         advantage_norm = ((advantage - adv_mean) / adv_std).clamp(-3.0, 3.0)
 
         # Eq. 33: L_actor = -E[log pi(a|s) * A(s,a)]
-        actor_loss = -(log_prob_new * advantage_norm).mean()
+        # Scale advantage to overcome Adam's internal state (log_prob is ~-0.05)
+        advantage_scaled = advantage_norm * 10.0
+        actor_loss = -(log_prob_new * advantage_scaled).mean()
 
         # Sanity check — if loss explodes, fall back to DDPG
-        if actor_loss.abs() > 50.0:
+        if actor_loss.abs() > 200.0:
             actor_loss = -value_est.mean()
 
         self.opt_actor.zero_grad()
@@ -365,6 +350,8 @@ class HDMTrainer:
         r = reward_value
         self.reward_history.append(r)
         self.cscqi_history.append(r)
+        self._last_log_prob = float(log_prob_new.mean().item())
+        self._last_advantage = float(advantage_norm.mean().item())
         return r, critic_loss.item(), actor_loss.item(), compute_isr(tasks)
 
     def train_batch_episode(self, batch_size: int = 8):
@@ -374,6 +361,16 @@ class HDMTrainer:
         self.critic.train()
 
         self.current_episode += 1
+
+        # Cycle through tasks_per_csca schedule for curriculum congestion
+        tpc = self.tasks_schedule[self.current_episode % len(self.tasks_schedule)]
+        self.env = MultiCSCAEnvironment(
+            n_cscas=self.n_cscas,
+            n_relays=self.n_relays,
+            bandwidth_total_hz=5e6,
+            difficulty="medium",
+            tasks_per_csca=tpc,
+        )
 
         # Log phase transitions
         if self.current_episode in [1, 200, 500]:
@@ -389,7 +386,7 @@ class HDMTrainer:
         for _ in range(batch_size):
             # Generate diverse intent vectors
             intent_vectors = []
-            for i in range(self.n_tasks):
+            for i in range(self.env.n_tasks):  # Generate for ALL tasks, not just n_cscas
                 if i % 3 == 0:
                     du = np.random.uniform(0.7, 1.0)
                     qr = np.random.uniform(0.3, 0.6)
@@ -480,10 +477,12 @@ class HDMTrainer:
         advantage_norm = ((advantage_b - adv_mean) / adv_std).clamp(-3.0, 3.0)
 
         # Per-sample product THEN mean — correct Eq. 33
-        actor_loss = -(log_probs_stacked * advantage_norm).mean()
+        # Scale advantage to overcome Adam's internal state (log_prob is ~-0.05)
+        advantage_scaled = advantage_norm * 10.0
+        actor_loss = -(log_probs_stacked * advantage_scaled).mean()
 
         # Sanity check — fallback if loss explodes
-        if actor_loss.abs() > 50.0 or torch.isnan(actor_loss):
+        if actor_loss.abs() > 200.0 or torch.isnan(actor_loss):
             action_new = self.actor(graph_embs, message_embs=None)
             q_value = self.critic(graph_embs.detach(), action_new)
             actor_loss = -q_value.mean()
@@ -502,6 +501,10 @@ class HDMTrainer:
         # Compute ISR from the last batch's tasks
         last_tasks = channel_result["tasks"] if 'channel_result' in dir() else []
         isr = compute_isr(last_tasks) if last_tasks else 0.0
+
+        # Store for logging
+        self._last_log_prob = float(log_probs_stacked.mean().item())
+        self._last_advantage = float(advantage_norm.mean().item())
 
         # Step LR schedulers
         self.scheduler_actor.step()
@@ -526,8 +529,11 @@ class HDMTrainer:
 
             if ep % 50 == 0:
                 current_lr = self.opt_actor.param_groups[0]['lr']
+                lp = getattr(self, '_last_log_prob', 0.0)
+                adv = getattr(self, '_last_advantage', 0.0)
                 log(f"Episode {ep}/{max_episodes} | CSCQI: {reward:.4f} | ISR: {isr:.3f} | "
                     f"Critic: {c_loss:.4f} | Actor: {a_loss:.4f} | "
+                    f"logP: {lp:.4f} | adv: {adv:.4f} | "
                     f"LR: {current_lr:.6f} | Buffer: {len(self.replay_buffer)}")
 
             if ep % 50 == 0:
