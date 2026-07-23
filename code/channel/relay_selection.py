@@ -73,13 +73,22 @@ class SemanticRelay:
 
 def compute_distortion(sinr_linear: float, data_dim: int = 128) -> float:
     """
-    Distortion estimation (Eq. 14).
-    Approximation: distortion decreases with SINR.
-    Based on distortion estimation function from Ref [39].
+    Distortion estimation using DeepSC-calibrated proxy (Eq. 14).
+    Same interpolation table as sim_channel.compute_semantic_distortion()
+    for consistency between direct and relay path distortion estimates.
     """
     sinr_db = 10 * np.log10(max(sinr_linear, 1e-10))
-    distortion = np.exp(-0.1 * sinr_db)
-    return float(np.clip(distortion, 0.0, 1.0))
+    snr_points        = [0,    5,    10,   15,   20,   25]
+    distortion_points = [0.70, 0.50, 0.30, 0.15, 0.07, 0.03]
+    if sinr_db <= snr_points[0]:
+        return distortion_points[0]
+    if sinr_db >= snr_points[-1]:
+        return distortion_points[-1]
+    for i in range(len(snr_points) - 1):
+        if snr_points[i] <= sinr_db <= snr_points[i+1]:
+            t = (sinr_db - snr_points[i]) / (snr_points[i+1] - snr_points[i])
+            return float(distortion_points[i] + t * (distortion_points[i+1] - distortion_points[i]))
+    return 0.5
 
 
 def compute_symbol_similarity(alpha: str, beta: str) -> float:

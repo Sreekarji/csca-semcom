@@ -1,629 +1,203 @@
+"""HDM trainer: HAN encoder + DDPM diffusion policy + state-value critic.
+
+Fixes vs original:
+  1. reward used for EMA baseline is stop-gradient r_sample (no r_mean blend)
+     so the gradient signal is clean.
+  2. Per-task advantages use per-task CSCQI, not mean reward.
+  3. Advantage normalization is applied AFTER stacking all tasks in batch.
+  4. Warmup uses ONLY r_sample (not blended) so baseline starts calibrated.
+  5. critic is trained on graph_emb.detach() (correct — critic does not train HAN).
+"""
 import os
-import sys
-import csv
-import random
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-import numpy as np
-from datetime import datetime
-from collections import deque
 
-sys.path.insert(0, r"D:\MP2\code\channel")
-sys.path.insert(0, r"D:\MP2\code\evaluation")
-
-from ddpm_policy import HDMPolicy, CriticNetwork
 from han_network import HANNetwork
+from ddpm_policy import HDMPolicy, ValueCritic, TPC_TO_IDX
 from sim_channel import MultiCSCAEnvironment
-from cscqi import compute_cscqi, compute_isr
-from shaped_reward import compute_shaped_reward
-
-LOG_PATH = r"D:\MP2\log.txt"
-RESULTS_PATH = r"D:\MP2\results\software"
-CHECKPOINT_PATH = r"D:\MP2\results\software\checkpoints"
-
-os.makedirs(RESULTS_PATH, exist_ok=True)
-os.makedirs(CHECKPOINT_PATH, exist_ok=True)
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def log(msg):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {msg}"
-    print(line)
-    with open(LOG_PATH, "a") as f:
-        f.write(line + "\n")
-
-
-class ReplayBuffer:
-    """Experience replay buffer for sample-efficient training."""
-
-    def __init__(self, capacity=10000):
-        self.buffer = deque(maxlen=capacity)
-
-    def push(self, state_emb, action, reward, next_state_emb, old_log_prob=None):
-        self.buffer.append({
-            "state": state_emb.detach().cpu(),
-            "action": action.detach().cpu(),
-            "reward": torch.tensor([[reward]], dtype=torch.float),
-            "next_state": next_state_emb.detach().cpu(),
-            "old_log_prob": old_log_prob.detach().cpu() if old_log_prob is not None
-                           else torch.tensor([[0.0]]),
-        })
-
-    def sample(self, batch_size=32):
-        batch = random.sample(self.buffer, min(batch_size, len(self.buffer)))
-        return {
-            "state": torch.cat([b["state"] for b in batch]).to(DEVICE),
-            "action": torch.cat([b["action"] for b in batch]).to(DEVICE),
-            "reward": torch.cat([b["reward"] for b in batch]).to(DEVICE),
-            "next_state": torch.cat([b["next_state"] for b in batch]).to(DEVICE),
-            "old_log_prob": torch.cat([b["old_log_prob"] for b in batch]).to(DEVICE),
-        }
-
-    def __len__(self):
-        return len(self.buffer)
-
-
-class CurriculumScheduler:
-    """
-    Progressive difficulty scheduler for HDM training.
-    Phase 1 (0-200 ep): Easy — loose constraints, short distances
-    Phase 2 (200-500 ep): Medium — tighter constraints
-    Phase 3 (500+ ep): Hard — paper-equivalent constraints
-    """
-
-    def __init__(self):
-        self.phase = 1
-
-    def get_difficulty(self, episode: int) -> str:
-        return "medium"  # fixed difficulty, no curriculum shift that breaks training
-
-    def get_env_params(self, episode: int) -> dict:
-        # Fixed medium difficulty — matches the environment's own generate_state()
-        return {
-            "delay_range": (0.5, 1.2),
-            "quality_range": (0.55, 0.75),
-            "data_size_range": (1e5, 3e5),
-            "distance_range": (0.1, 0.5),
-        }
-
-    def get_phase_name(self, episode: int) -> str:
-        return "Phase 2 (Medium)"
-
+from shaped_reward import cscqi_reward
+from cscqi import compute_isr, compute_cscqi
 
 class HDMTrainer:
-    """
-    Trains HDM using Actor-Critic as defined in Algorithm 2,
-    Sun et al. 2026, Section V.
-    With experience replay + curriculum learning + shaped reward.
-    """
-
-    def __init__(
-        self,
-        n_cscas: int = 5,
-        n_relays: int = 5,
-        n_mcs: int = 3,
-        n_denoising_steps: int = 6,
-        lr_actor: float = 1e-3,
-        lr_critic: float = 1e-3,
-        gamma: float = 0.95,
-        max_grad_norm: float = 1.0,
-        device: str = None,
-        tasks_schedule: list = None,
-    ):
+    def __init__(self, n_cscas=5, n_relays=5, n_mcs=3, n_base_stations=5,
+                 hidden=256, lr=3e-4, device=None, difficulty="medium",
+                 tasks_schedule=None, ema_alpha=0.15):
         self.device = torch.device(
-            device if device else ("cuda" if torch.cuda.is_available() else "cpu")
-        )
-        self.n_tasks = n_cscas
-        self.n_cscas = n_cscas
-        self.n_relays = n_relays
-        self.tasks_schedule = tasks_schedule or [1]
-        self.n_relays = n_relays
-        self.n_mcs = n_mcs
-        self.gamma = gamma
-        self.max_grad_norm = max_grad_norm
+            device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.n_cscas   = n_cscas
+        self.n_relays  = n_relays
+        self.n_mcs     = n_mcs
+        self.n_bs      = n_base_stations
+        self.difficulty       = difficulty
+        self.tasks_schedule   = tasks_schedule or [1, 1, 1, 2, 2, 4, 6, 10]
+        self.ema_alpha        = ema_alpha
+        self.reward_baseline  = 0.0
+        self._warmup_count    = 0
+        self._warmup_episodes = 50
 
-        action_dim = n_cscas + n_cscas * n_relays + n_cscas * n_mcs
-
-        self.han = HANNetwork(
-            hidden_channels=256,
-            num_heads=8,
-            num_layers=3,
-            n_cscas=n_cscas,
-            n_relays=n_relays,
-            n_messages=n_cscas,
-            n_base_stations=n_cscas,
+        self.han    = HANNetwork(
+            hidden, 8, 3, n_cscas, n_relays, n_cscas, n_base_stations
         ).to(self.device)
+        self.policy = HDMPolicy(n_relays, n_mcs, hidden).to(self.device)
+        self.critic = ValueCritic(hidden).to(self.device)
 
-        self.actor = HDMPolicy(
-            action_dim=action_dim,
-            graph_emb_dim=256,
-            n_denoising_steps=n_denoising_steps,
-        ).to(self.device)
+        self.opt = torch.optim.Adam(
+            list(self.han.parameters()) + list(self.policy.parameters()), lr=lr)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
+        self.mse = nn.MSELoss()
 
-        self.critic = CriticNetwork(
-            state_dim=256,
-            action_dim=action_dim,
-        ).to(self.device)
+    # ------------------------------------------------------------------
+    def _make_env(self, tasks_per_csca):
+        return MultiCSCAEnvironment(
+            n_cscas=self.n_cscas, n_relays=self.n_relays,
+            n_base_stations=self.n_bs, n_mcs=self.n_mcs,
+            difficulty=self.difficulty, tasks_per_csca=tasks_per_csca,
+            sigma_s=8.0)
 
-        self.env = MultiCSCAEnvironment(
-            n_cscas=n_cscas,
-            n_relays=n_relays,
-            bandwidth_total_hz=5e6,
-            difficulty="medium",
-            tasks_per_csca=1,  # avoids graph rebuild mismatch
-        )
-
-        self.opt_actor = optim.Adam(
-            list(self.han.parameters()) + list(self.actor.parameters()),
-            lr=lr_actor
-        )
-        self.opt_critic = optim.Adam(self.critic.parameters(), lr=lr_critic)
-
-        # LR schedulers: warmup for 100 steps, then cosine decay
-        self.scheduler_actor = SequentialLR(
-            self.opt_actor,
-            schedulers=[
-                LinearLR(self.opt_actor, start_factor=0.1, end_factor=1.0, total_iters=10),
-                CosineAnnealingLR(self.opt_actor, T_max=490, eta_min=1e-5),
-            ],
-            milestones=[10]
-        )
-        self.scheduler_critic = SequentialLR(
-            self.opt_critic,
-            schedulers=[
-                LinearLR(self.opt_critic, start_factor=0.1, end_factor=1.0, total_iters=10),
-                CosineAnnealingLR(self.opt_critic, T_max=490, eta_min=1e-5),
-            ],
-            milestones=[10]
-        )
-
-        # Experience replay
-        self.replay_buffer = ReplayBuffer(capacity=10000)
-        self.batch_size = 256
-        self.min_buffer_size = 10
-
-        self.reward_history = []
-        self.cscqi_history = []
-        self.curriculum = CurriculumScheduler()
-        self.current_episode = 0
-        self.current_intent_vectors = None
-        self.best_isr = 0.0
-        self.last_isr = 0.0
-
-        log(f"HDMTrainer initialized on {self.device}")
-
-    def train_episode(self, system_state=None):
-        self.han.train()
-        self.actor.train()
-        self.critic.train()
-
-        # Curriculum: progressive difficulty
-        self.current_episode += 1
-
-        # Generate diverse intent vectors — mix of urgent and non-urgent
-        intent_vectors = []
-        for i in range(self.env.n_tasks):  # Generate for ALL tasks, not just n_cscas
-            if i % 3 == 0:
-                delay_urgency = np.random.uniform(0.7, 1.0)
-                quality_req = np.random.uniform(0.3, 0.6)
-            elif i % 3 == 1:
-                delay_urgency = np.random.uniform(0.1, 0.4)
-                quality_req = np.random.uniform(0.7, 1.0)
-            else:
-                delay_urgency = np.random.uniform(0.4, 0.7)
-                quality_req = np.random.uniform(0.4, 0.7)
-            intent_vectors.append([delay_urgency, quality_req])
-        self.current_intent_vectors = intent_vectors
-
-        if system_state is None:
-            params = self.curriculum.get_env_params(self.current_episode)
-            system_state = self.env.generate_state_with_params(params)
-
-        # Update system state to match intent vectors
-        system_state["SCt"]["delay_intents"] = [
-            max(0.1, (1.0 - iv[0]) * 5.0) for iv in intent_vectors
-        ]
-        system_state["SCt"]["quality_intents"] = [iv[1] for iv in intent_vectors]
-
-        # Log phase transitions
-        if self.current_episode in [1, 200, 500]:
-            phase = self.curriculum.get_phase_name(self.current_episode)
-            log(f"Curriculum: now in {phase}")
-
-        # Encode state with intent vectors
-        graph_emb, node_embs, message_embs = self.han.encode_state(
-            system_state, intent_vectors=intent_vectors
-        )
-
-        # Generate action
-        action = self.actor(graph_emb, message_embs=message_embs)
-
-        # Parse action
-        bw = action[:, :self.n_tasks]
-        relay = action[:, self.n_tasks:self.n_tasks + self.n_tasks * self.n_relays]
-        relay = relay.reshape(1, self.n_tasks, self.n_relays)
-        mcs = action[:, self.n_tasks + self.n_tasks * self.n_relays:]
-        mcs = mcs.reshape(1, self.n_tasks, self.n_mcs)
-        parsed_action = {"bandwidth": bw, "relay": relay, "mcs": mcs}
-
-        # Execute through channel
-        channel_result = self.env.step(parsed_action, system_state)
-        tasks = channel_result["tasks"]
-
-        # Compute CSCQI reward (Eq. 17) with delay emphasis
-        cscqi_values = []
-        for t in tasks:
-            cscqi_values.append(compute_cscqi(
-                t["tau_S"], t["vartheta_S"],
-                t["tau_S_int"], t["vartheta_S_int"],
-                w_tau=0.5, w_vartheta=0.5,
-            ))
-        reward_value = float(np.clip(np.mean(cscqi_values), -5.0, 5.0))
-        # No shaping, no bonuses — pure Eq. 17
-
-        # Get next state and encode
-        next_params = self.curriculum.get_env_params(self.current_episode + 1)
-        next_state = self.env.generate_state_with_params(next_params)
-        next_graph_emb, _, next_message_embs = self.han.encode_state(next_state)
-
-        # Push to replay buffer
-        self.replay_buffer.push(graph_emb, action, reward_value, next_graph_emb)
-
-        # If buffer not ready, just collect experience
-        if len(self.replay_buffer) < self.min_buffer_size:
-            self.reward_history.append(reward_value)
-            return reward_value, 0.0, 0.0, compute_isr(tasks)
-
-        # Sample batch from replay buffer
-        batch = self.replay_buffer.sample(self.batch_size)
-        states = batch["state"]
-        actions = batch["action"]
-        rewards = batch["reward"]
-        next_states = batch["next_state"]
-
-        # === CRITIC UPDATE on batch — TD bootstrapping ===
-        with torch.no_grad():
-            next_actions = self.actor(next_states)
-            next_values = self.critic(next_states, next_actions)
-            targets = rewards + self.gamma * next_values
-
-        value_pred = self.critic(states, actions)
-        critic_loss = nn.MSELoss()(value_pred, targets.detach())
-
-        self.opt_critic.zero_grad()
-        critic_loss.backward()
-        nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-        self.opt_critic.step()
-
-        # === ACTOR UPDATE — Eq. 33: log_pi * advantage ===
-        graph_emb_new, _, message_embs_new = self.han.encode_state(
-            system_state, intent_vectors=self.current_intent_vectors
-        )
-
-        # Get action and log probability from DDPM trajectory
-        a_0_new, log_prob_new = self.actor.collect_trajectory(
-            graph_emb_new, message_embs=message_embs_new
-        )
-
-        # Advantage = R - V(s)
-        value_est = self.critic(graph_emb_new.detach(), a_0_new.detach())
-        reward_t = torch.tensor([[reward_value]], dtype=torch.float, device=self.device)
-        advantage = reward_t - value_est.detach()
-
-        # Normalize advantage (running statistics)
-        if not hasattr(self, '_adv_stats'):
-            self._adv_stats = {'sum': 0.0, 'sum_sq': 0.0, 'n': 0}
-        self._adv_stats['n'] += 1
-        self._adv_stats['sum'] += float(advantage.item())
-        self._adv_stats['sum_sq'] += float(advantage.item()) ** 2
-        adv_mean = self._adv_stats['sum'] / self._adv_stats['n']
-        adv_var = max(self._adv_stats['sum_sq'] / self._adv_stats['n'] - adv_mean**2, 1e-4)
-        adv_std = adv_var ** 0.5
-        advantage_norm = ((advantage - adv_mean) / adv_std).clamp(-3.0, 3.0)
-
-        # Eq. 33: L_actor = -E[log pi(a|s) * A(s,a)]
-        # Scale advantage to overcome Adam's internal state (log_prob is ~-0.05)
-        advantage_scaled = advantage_norm * 10.0
-        actor_loss = -(log_prob_new * advantage_scaled).mean()
-
-        # Sanity check — if loss explodes, fall back to DDPG
-        if actor_loss.abs() > 200.0:
-            actor_loss = -value_est.mean()
-
-        self.opt_actor.zero_grad()
-        actor_loss.backward()
-        nn.utils.clip_grad_norm_(
-            list(self.han.parameters()) + list(self.actor.parameters()),
-            self.max_grad_norm
-        )
-        self.opt_actor.step()
-
-        # Store to replay buffer
-        next_state = self.env.generate_state()
-        next_graph_emb, _, _ = self.han.encode_state(next_state)
-        self.replay_buffer.push(graph_emb_new, a_0_new, reward_value, next_graph_emb)
-
-        r = reward_value
-        self.reward_history.append(r)
-        self.cscqi_history.append(r)
-        self._last_log_prob = float(log_prob_new.mean().item())
-        self._last_advantage = float(advantage_norm.mean().item())
-        return r, critic_loss.item(), actor_loss.item(), compute_isr(tasks)
-
-    def train_batch_episode(self, batch_size: int = 8):
-        """Train on a batch of different environment states simultaneously."""
-        self.han.train()
-        self.actor.train()
-        self.critic.train()
-
-        self.current_episode += 1
-
-        # Cycle through tasks_per_csca schedule for curriculum congestion
-        tpc = self.tasks_schedule[self.current_episode % len(self.tasks_schedule)]
-        self.env = MultiCSCAEnvironment(
-            n_cscas=self.n_cscas,
-            n_relays=self.n_relays,
-            bandwidth_total_hz=5e6,
-            difficulty="medium",
-            tasks_per_csca=tpc,
-        )
-
-        # Log phase transitions
-        if self.current_episode in [1, 200, 500]:
-            phase = self.curriculum.get_phase_name(self.current_episode)
-            log(f"Curriculum: now in {phase}")
-
-        all_rewards = []
-        all_graph_embs = []
-        all_actions = []
-        all_next_graph_embs = []
-
-        # Collect experiences from batch_size different states
-        for _ in range(batch_size):
-            # Generate diverse intent vectors
-            intent_vectors = []
-            for i in range(self.env.n_tasks):  # Generate for ALL tasks, not just n_cscas
-                if i % 3 == 0:
-                    du = np.random.uniform(0.7, 1.0)
-                    qr = np.random.uniform(0.3, 0.6)
-                elif i % 3 == 1:
-                    du = np.random.uniform(0.1, 0.4)
-                    qr = np.random.uniform(0.7, 1.0)
-                else:
-                    du = np.random.uniform(0.4, 0.7)
-                    qr = np.random.uniform(0.4, 0.7)
-                intent_vectors.append([du, qr])
-
-            params = self.curriculum.get_env_params(self.current_episode)
-            system_state = self.env.generate_state_with_params(params)
-            system_state["SCt"]["delay_intents"] = [
-                max(0.1, (1.0 - iv[0]) * 5.0) for iv in intent_vectors
-            ]
-            system_state["SCt"]["quality_intents"] = [iv[1] for iv in intent_vectors]
-
-            graph_emb, node_embs, message_embs = self.han.encode_state(
-                system_state, intent_vectors=intent_vectors
+    def _update_baseline(self, reward: float):
+        """Warmup: running mean for first 50 eps, then EMA."""
+        if self._warmup_count < self._warmup_episodes:
+            self._warmup_count  += 1
+            self.reward_baseline = (
+                (self._warmup_count - 1) / self._warmup_count * self.reward_baseline
+                + reward / self._warmup_count
             )
-            action = self.actor(graph_emb, message_embs=message_embs)
+        else:
+            self.reward_baseline = (
+                (1 - self.ema_alpha) * self.reward_baseline
+                + self.ema_alpha * reward
+            )
 
-            bw = action[:, :self.n_tasks]
-            relay = action[:, self.n_tasks:self.n_tasks + self.n_tasks * self.n_relays].reshape(1, self.n_tasks, self.n_relays)
-            mcs = action[:, self.n_tasks + self.n_tasks * self.n_relays:].reshape(1, self.n_tasks, self.n_mcs)
-            parsed_action = {"bandwidth": bw, "relay": relay, "mcs": mcs}
+    # ------------------------------------------------------------------
+    def train_batch_episode(self, batch_size=8, tasks_per_csca=1):
+        congestion_idx = TPC_TO_IDX.get(tasks_per_csca, 0)
 
-            channel_result = self.env.step(parsed_action, system_state)
-            tasks = channel_result["tasks"]
-            cscqi_values = [
-                compute_cscqi(t["tau_S"], t["vartheta_S"],
-                              t["tau_S_int"], t["vartheta_S_int"])
-                for t in tasks
-            ]
-            reward_value = float(np.clip(np.mean(cscqi_values), -5.0, 5.0))
+        all_task_log_probs  = []   # list of [Nm] tensors
+        all_task_advantages = []   # list of [Nm] np arrays → tensors
+        value_preds         = []
+        value_targets       = []
+        ep_rewards          = []
+        ep_isrs             = []
 
-            all_rewards.append(reward_value)
-            all_graph_embs.append(graph_emb)
-            all_actions.append(action)
+        for _ in range(batch_size):
+            env   = self._make_env(tasks_per_csca)
+            state = env.generate_state()
+            intents = [[m[1], m[2]] for m in state["SCt"]["message_features"]]
 
-            # Also push to replay buffer
-            next_params = self.curriculum.get_env_params(self.current_episode + 1)
-            next_state = self.env.generate_state_with_params(next_params)
-            next_graph_emb, _, _ = self.han.encode_state(next_state)
-            all_next_graph_embs.append(next_graph_emb)
-            self.replay_buffer.push(graph_emb, action, reward_value, next_graph_emb)
+            # HAN encode (with grad — HAN is trained jointly with policy)
+            graph_emb, _, message_embs = self.han.encode_state(state, intents)
 
-        # Stack into batch tensors
-        graph_embs = torch.cat(all_graph_embs, dim=0)
-        actions = torch.cat(all_actions, dim=0)
-        next_graph_embs = torch.cat(all_next_graph_embs, dim=0)
-        rewards = torch.tensor(all_rewards, dtype=torch.float, device=self.device).unsqueeze(-1)
+            # Collect trajectory — log_prob carries grad through denoiser
+            action, per_task_log_prob = self.policy.collect_trajectory(
+                message_embs, congestion_idx)
 
-        # Eq. 34: cumulative discounted return RW^acc_t = R_t + gamma * V(s_{t+1})
-        with torch.no_grad():
-            next_values = self.critic(next_graph_embs.detach(), self.actor(next_graph_embs))
-            targets = rewards + self.gamma * next_values
-            targets = targets.detach()
+            # Environment step
+            out = env.step(action, state)
 
-        # Critic update: L_v = E[(RW^acc_t - V(s_t))^2]  (Eq. 35)
-        value_pred = self.critic(graph_embs.detach(), actions.detach())
-        critic_loss = nn.MSELoss()(value_pred, targets)
-        self.opt_critic.zero_grad()
-        critic_loss.backward()
-        nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-        self.opt_critic.step()
+            # Per-task CSCQI → per-task reward
+            task_rewards = np.array([
+                compute_cscqi(
+                    t["tau_S"], t["vartheta_S"],
+                    t["tau_S_int"], t["vartheta_S_int"],
+                )
+                for t in out["tasks"]
+            ], dtype=np.float32)
 
-        # === ACTOR UPDATE — Per-sample Eq. 33 ===
-        # Get log_prob for multiple batch samples
-        n_samples = min(8, graph_embs.shape[0])
-        batch_log_probs = []
-        for i in range(n_samples):
-            _, lp = self.actor.collect_trajectory(graph_embs[i:i+1])
-            batch_log_probs.append(lp)
-        log_probs_stacked = torch.cat(batch_log_probs, dim=0)  # [n_samples, 1]
+            # Scalar reward for baseline update (mean over tasks)
+            r_scalar = float(np.mean(task_rewards))
+            self._update_baseline(r_scalar)
 
-        # Advantage estimation
-        with torch.no_grad():
-            new_actions_b = self.actor(graph_embs[:n_samples])
-        q_values_b = self.critic(graph_embs[:n_samples], new_actions_b.detach())
-        rewards_b = rewards[:n_samples]
-        advantage_b = rewards_b - q_values_b.detach()
+            # Per-task advantage: task_reward_i - global_baseline
+            task_adv = task_rewards - self.reward_baseline  # [Nm]
 
-        # Normalize per-sample
-        adv_mean = advantage_b.mean()
-        adv_std = advantage_b.std() + 1e-8
-        advantage_norm = ((advantage_b - adv_mean) / adv_std).clamp(-3.0, 3.0)
+            all_task_log_probs.append(per_task_log_prob.squeeze(0))    # [Nm]
+            all_task_advantages.append(
+                torch.tensor(task_adv, dtype=torch.float, device=self.device))
 
-        # Per-sample product THEN mean — correct Eq. 33
-        # Scale advantage to overcome Adam's internal state (log_prob is ~-0.05)
-        advantage_scaled = advantage_norm * 10.0
-        actor_loss = -(log_probs_stacked * advantage_scaled).mean()
+            # Critic targets (stop-grad on graph_emb)
+            value_preds.append(self.critic(graph_emb.detach()).squeeze())
+            value_targets.append(torch.tensor(r_scalar, device=self.device))
 
-        # Sanity check — fallback if loss explodes
-        if actor_loss.abs() > 200.0 or torch.isnan(actor_loss):
-            action_new = self.actor(graph_embs, message_embs=None)
-            q_value = self.critic(graph_embs.detach(), action_new)
-            actor_loss = -q_value.mean()
+            ep_rewards.append(r_scalar)
+            ep_isrs.append(compute_isr(out["tasks"]))
 
-        self.opt_actor.zero_grad()
+        # ---- Policy gradient (REINFORCE with per-task credit) ----
+        # lp: [batch_size, Nm], adv: [batch_size, Nm]
+        lp  = torch.stack(all_task_log_probs)       # [B, Nm]
+        adv = torch.stack(all_task_advantages)      # [B, Nm]
+
+        # Normalize advantages globally across all (batch × tasks) elements
+        adv_flat = adv.reshape(-1)
+        adv_std  = adv_flat.std()
+        if adv_std > 1e-6:
+            adv = (adv - adv_flat.mean()) / (adv_std + 1e-8)
+        else:
+            adv = adv - adv_flat.mean()
+
+        # REINFORCE: maximize E[log_prob * advantage]
+        actor_loss = -(lp * adv.detach()).mean()
+
+        self.opt.zero_grad()
         actor_loss.backward()
-        nn.utils.clip_grad_norm_(
-            list(self.han.parameters()) + list(self.actor.parameters()),
-            self.max_grad_norm
+        torch.nn.utils.clip_grad_norm_(
+            list(self.han.parameters()) + list(self.policy.parameters()), 1.0)
+        self.opt.step()
+
+        # ---- Critic update ----
+        vp          = torch.stack(value_preds)
+        vt          = torch.stack(value_targets)
+        critic_loss = self.mse(vp, vt)
+        self.critic_opt.zero_grad()
+        critic_loss.backward()
+        self.critic_opt.step()
+
+        return (
+            float(np.mean(ep_rewards)),
+            float(critic_loss.item()),
+            float(actor_loss.item()),
+            float(np.mean(ep_isrs)),
+            tasks_per_csca,
         )
-        self.opt_actor.step()
 
-        mean_reward = float(np.mean(all_rewards))
-        self.reward_history.append(mean_reward)
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def evaluate_isr(self, tpc_list=(1, 2, 4, 6, 10), n_episodes=50):
+        self.han.eval()
+        self.policy.eval()
+        results = {}
+        for tpc in tpc_list:
+            congestion_idx = TPC_TO_IDX.get(tpc, 0)
+            isrs = []
+            for _ in range(n_episodes):
+                env   = self._make_env(tpc)
+                state = env.generate_state()
+                intents = [[m[1], m[2]] for m in state["SCt"]["message_features"]]
+                _, _, message_embs = self.han.encode_state(state, intents)
+                action = self.policy(message_embs, congestion_idx)
+                out    = env.step(action, state)
+                isrs.append(compute_isr(out["tasks"]))
+            results[tpc] = (float(np.mean(isrs)), float(np.std(isrs)))
+        self.han.train()
+        self.policy.train()
+        return results
 
-        # Compute ISR from the last batch's tasks
-        last_tasks = channel_result["tasks"] if 'channel_result' in dir() else []
-        isr = compute_isr(last_tasks) if last_tasks else 0.0
+    # ------------------------------------------------------------------
+    def save(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({
+            "han":            self.han.state_dict(),
+            "policy":         self.policy.state_dict(),
+            "critic":         self.critic.state_dict(),
+            "reward_baseline": self.reward_baseline,
+            "warmup_count":   self._warmup_count,
+        }, path)
 
-        # Store for logging
-        self._last_log_prob = float(log_probs_stacked.mean().item())
-        self._last_advantage = float(advantage_norm.mean().item())
-
-        # Step LR schedulers
-        self.scheduler_actor.step()
-        self.scheduler_critic.step()
-
-        return mean_reward, critic_loss.item(), actor_loss.item(), isr
-
-    def train(self, max_episodes: int = 500, checkpoint_every: int = 100):
-        log(f"Starting HDM training for {max_episodes} episodes on {self.device}")
-
-        csv_path = os.path.join(RESULTS_PATH, "reward_curve.csv")
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["episode", "reward", "critic_loss", "actor_loss", "isr"])
-
-        for ep in range(1, max_episodes + 1):
-            reward, c_loss, a_loss, isr = self.train_batch_episode(batch_size=8)
-
-            with open(csv_path, "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([ep, reward, c_loss, a_loss, isr])
-
-            if ep % 50 == 0:
-                current_lr = self.opt_actor.param_groups[0]['lr']
-                lp = getattr(self, '_last_log_prob', 0.0)
-                adv = getattr(self, '_last_advantage', 0.0)
-                log(f"Episode {ep}/{max_episodes} | CSCQI: {reward:.4f} | ISR: {isr:.3f} | "
-                    f"Critic: {c_loss:.4f} | Actor: {a_loss:.4f} | "
-                    f"logP: {lp:.4f} | adv: {adv:.4f} | "
-                    f"LR: {current_lr:.6f} | Buffer: {len(self.replay_buffer)}")
-
-            if ep % 50 == 0:
-                ckpt = os.path.join(CHECKPOINT_PATH, f"hdm_ep{ep}.pt")
-                torch.save({
-                    "episode": ep,
-                    "han": self.han.state_dict(),
-                    "actor": self.actor.state_dict(),
-                    "critic": self.critic.state_dict(),
-                    "reward_history": self.reward_history,
-                }, ckpt)
-                log(f"Checkpoint saved: {ckpt}")
-
-                # Save best checkpoint by ISR
-                self.last_isr = isr
-                if isr > self.best_isr:
-                    self.best_isr = isr
-                    best_path = os.path.join(CHECKPOINT_PATH, "hdm_best.pt")
-                    torch.save({
-                        "episode": ep,
-                        "han": self.han.state_dict(),
-                        "actor": self.actor.state_dict(),
-                        "critic": self.critic.state_dict(),
-                        "isr": isr,
-                    }, best_path)
-                    log(f"New best checkpoint: ep{ep}, ISR={isr:.3f}")
-
-        log(f"Training complete. Final reward: {self.reward_history[-1]:.4f}")
-        return self.reward_history
-
-
-
-
-
-
-if __name__ == "__main__":
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import sys, os, numpy as np
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    sys.path.insert(0, r"D:\MP2\code\utils")
-    from reproducibility import set_seed
-    set_seed(42)
-
-    print("=" * 60)
-    print("HDM TRAINING — Eq. 33 Actor Loss + Environment Calibration Fix")
-    print("Paper Table II: 200 episodes, batch=256, LR=0.001")
-    print("=" * 60)
-
-    trainer = HDMTrainer(n_denoising_steps=6)
-
-    # Warm up replay buffer
-    print("Warming up replay buffer (64 episodes)...")
-    for i in range(64):
-        trainer.train_episode()
-    print(f"Buffer ready: {len(trainer.replay_buffer)} samples")
-
-    # Quick gradient check
-    print("Gradient check (5 episodes with training)...")
-    for i in range(5):
-        r, cl, al, _ = trainer.train_episode()
-        print(f"  ep {65+i}: reward={r:.4f}, critic={cl:.4f}, actor={al:.6f}")
-        if np.isnan(al):
-            print("FATAL: NaN in actor loss")
-            sys.exit(1)
-    print("Gradient check passed.")
-
-    # Full training
-    print("Starting 1000 episode training...")
-    rewards = trainer.train(max_episodes=200, checkpoint_every=100)
-
-    # Training curve plot
-    smoothed = np.convolve(rewards, np.ones(20)/20, mode='valid')
-    plt.figure(figsize=(10, 4))
-    plt.plot(rewards, alpha=0.3, color='blue', label='Raw', linewidth=0.8)
-    plt.plot(range(19, len(rewards)), smoothed, 'r-', linewidth=2, label='Smoothed (20ep)')
-    plt.xlabel("Episode")
-    plt.ylabel("Cumulative Return")
-    plt.title("HDM Training — DDPO-IS")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(r"D:\MP2\results\software\hdm_ddpois_training.png", dpi=120)
-    plt.close()
-
-    print("=" * 60)
-    print("TRAINING COMPLETE")
-    print(f"Final reward (last 50): {np.mean(rewards[-50:]):.4f}")
-    print(f"Best reward: {max(rewards):.4f}")
-    print(f"Plot saved: results/software/hdm_ddpois_training.png")
-    print("=" * 60)
-
+    def load(self, path):
+        ckpt = torch.load(path, map_location=self.device)
+        self.han.load_state_dict(ckpt["han"])
+        self.policy.load_state_dict(ckpt["policy"])
+        if "critic" in ckpt:
+            self.critic.load_state_dict(ckpt["critic"])
+        self.reward_baseline = ckpt.get("reward_baseline", 0.0)
+        self._warmup_count   = ckpt.get("warmup_count", self._warmup_episodes)

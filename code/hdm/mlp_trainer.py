@@ -1,297 +1,163 @@
-"""
-MLP Trainer — HAN + MLP Actor-Critic training.
-Replaces DDPM policy with simple MLP for stable training.
-Tests whether HAN graph attention provides benefit independent of DDPM complexity.
+"""MLP trainer: HAN encoder + per-task MLP actor (HAN+MLP ablation).
 
-Actor loss: DDPG style -Q(s,a) (simple and stable)
-Critic loss: MSE (RW_acc - V(s))^2
+Uses identical per-task credit assignment as HDMTrainer for a fair comparison.
 """
-
 import os
-import sys
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
-import numpy as np
-from datetime import datetime
-from collections import deque
 
-sys.path.insert(0, r"D:\MP2\code\channel")
-sys.path.insert(0, r"D:\MP2\code\evaluation")
-sys.path.insert(0, r"D:\MP2\code\utils")
-
-from mlp_policy import MLPActor, MLPCritic
 from han_network import HANNetwork
+from mlp_policy import MLPActor, TPC_TO_IDX
+from ddpm_policy import ValueCritic
 from sim_channel import MultiCSCAEnvironment
-from cscqi import compute_cscqi, compute_isr
-from reproducibility import set_seed
-
-LOG_PATH = r"D:\MP2\log.txt"
-CHECKPOINT_PATH = r"D:\MP2\results\software\checkpoints"
-os.makedirs(CHECKPOINT_PATH, exist_ok=True)
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def log(msg):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {msg}"
-    print(line)
-    with open(LOG_PATH, "a") as f:
-        f.write(line + "\n")
-
-
-class MLPReplayBuffer:
-    def __init__(self, capacity=10000):
-        self.buffer = deque(maxlen=capacity)
-
-    def push(self, state_emb, action, reward, next_state_emb):
-        self.buffer.append({
-            "state": state_emb.detach().cpu(),
-            "action": action.detach().cpu(),
-            "reward": torch.tensor([[reward]], dtype=torch.float),
-            "next_state": next_state_emb.detach().cpu(),
-        })
-
-    def sample(self, batch_size):
-        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
-        batch = [self.buffer[i] for i in indices]
-        states = torch.cat([b["state"] for b in batch], dim=0).to(DEVICE)
-        actions = torch.cat([b["action"] for b in batch], dim=0).to(DEVICE)
-        rewards = torch.cat([b["reward"] for b in batch], dim=0).to(DEVICE)
-        next_states = torch.cat([b["next_state"] for b in batch], dim=0).to(DEVICE)
-        return {"state": states, "action": actions, "reward": rewards, "next_state": next_states}
-
-    def __len__(self):
-        return len(self.buffer)
-
-
-class CurriculumScheduler:
-    def __init__(self):
-        self.phases = {
-            "easy":   {"n_cscas": 5, "n_relays": 5},
-            "medium": {"n_cscas": 5, "n_relays": 5},
-        }
-
-    def get_env_params(self, episode):
-        if episode < 300:
-            return self.phases["easy"]
-        else:
-            return self.phases["medium"]
-
+from cscqi import compute_isr, compute_cscqi
 
 class MLPTrainer:
-    """
-    HAN + MLP Actor-Critic trainer.
-    Same HAN architecture as HDM trainer, but uses MLP instead of DDPM.
-    """
+    def __init__(self, n_cscas=5, n_relays=5, n_mcs=3, n_base_stations=5,
+                 hidden=256, lr=3e-4, device=None, difficulty="medium",
+                 tasks_schedule=None, ema_alpha=0.15):
+        self.device = torch.device(
+            device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.n_cscas   = n_cscas
+        self.n_relays  = n_relays
+        self.n_mcs     = n_mcs
+        self.n_bs      = n_base_stations
+        self.difficulty       = difficulty
+        self.tasks_schedule   = tasks_schedule or [1, 1, 1, 2, 2, 4, 6, 10]
+        self.ema_alpha        = ema_alpha
+        self.reward_baseline  = 0.0
+        self._warmup_count    = 0
+        self._warmup_episodes = 50
 
-    def __init__(self):
-        self.device = DEVICE
-        self.n_tasks = 5
-        self.n_relays = 5
-        self.n_mcs = 3
-        self.action_dim = self.n_tasks + self.n_tasks * self.n_relays + self.n_tasks * self.n_mcs
+        self.han    = HANNetwork(hidden, 8, 3, n_cscas, n_relays,
+                                 n_cscas, n_base_stations).to(self.device)
+        self.policy = MLPActor(hidden, hidden, n_relays, n_mcs).to(self.device)
+        self.critic = ValueCritic(hidden).to(self.device)
 
-        # HAN — SAME as HDM trainer
-        self.han = HANNetwork(
-            hidden_channels=256, num_heads=8, num_layers=3,
-            n_cscas=self.n_tasks, n_relays=self.n_relays,
-            n_messages=self.n_tasks, n_base_stations=self.n_tasks,
-        ).to(self.device)
+        self.opt = torch.optim.Adam(
+            list(self.han.parameters()) + list(self.policy.parameters()), lr=lr)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
+        self.mse = nn.MSELoss()
 
-        # MLP actor — replaces DDPM
-        self.actor = MLPActor(
-            graph_emb_dim=256, task_emb_dim=256,
-            action_dim=self.action_dim, hidden_dim=256,
-            n_tasks=self.n_tasks,
-        ).to(self.device)
+    def _make_env(self, tpc):
+        return MultiCSCAEnvironment(
+            n_cscas=self.n_cscas, n_relays=self.n_relays,
+            n_base_stations=self.n_bs, n_mcs=self.n_mcs,
+            difficulty=self.difficulty, tasks_per_csca=tpc, sigma_s=8.0)
 
-        # MLP critic
-        self.critic = MLPCritic(
-            state_dim=256, action_dim=self.action_dim, hidden_dim=256,
-        ).to(self.device)
+    def _update_baseline(self, reward: float):
+        if self._warmup_count < self._warmup_episodes:
+            self._warmup_count  += 1
+            self.reward_baseline = (
+                (self._warmup_count - 1) / self._warmup_count * self.reward_baseline
+                + reward / self._warmup_count
+            )
+        else:
+            self.reward_baseline = (
+                (1 - self.ema_alpha) * self.reward_baseline
+                + self.ema_alpha * reward
+            )
 
-        # Optimizers
-        self.opt_actor = optim.Adam(
-            list(self.han.parameters()) + list(self.actor.parameters()),
-            lr=1e-3
-        )
-        self.opt_critic = optim.Adam(
-            list(self.han.parameters()) + list(self.critic.parameters()),
-            lr=1e-3
-        )
+    def train_batch_episode(self, batch_size=8, tasks_per_csca=1):
+        congestion_idx = TPC_TO_IDX.get(tasks_per_csca, 0)
 
-        # Environment
-        self.env = MultiCSCAEnvironment(
-            n_cscas=self.n_tasks,
-            n_relays=self.n_relays,
-            difficulty="medium",
-            tasks_per_csca=1,
-        )
-        self.curriculum = CurriculumScheduler()
-        self.replay_buffer = MLPReplayBuffer(capacity=10000)
+        all_lp   = []
+        all_adv  = []
+        vp_list  = []
+        vt_list  = []
+        ep_rewards = []
+        ep_isrs    = []
 
-        # Training params
-        self.gamma = 0.95
-        self.batch_size = 256
-        self.min_buffer_size = 64
-        self.max_grad_norm = 1.0
-        self.current_episode = 0
-        self.reward_history = []
-        self.best_isr = 0.0
+        for _ in range(batch_size):
+            env   = self._make_env(tasks_per_csca)
+            state = env.generate_state()
+            intents = [[m[1], m[2]] for m in state["SCt"]["message_features"]]
+            graph_emb, _, message_embs = self.han.encode_state(state, intents)
 
-        log(f"MLPTrainer initialized on {self.device}")
+            action, per_task_lp = self.policy.collect_trajectory(
+                message_embs, congestion_idx)
+            out = env.step(action, state)
 
-    def _generate_intent_vectors(self):
-        intent_vectors = []
-        for _ in range(self.env.n_tasks):  # Generate for ALL tasks, not just n_cscas
-            urgency = np.random.uniform(0.4, 0.7)
-            quality = np.random.uniform(0.4, 0.7)
-            intent_vectors.append([urgency, quality])
-        return intent_vectors
+            task_rewards = np.array([
+                compute_cscqi(t["tau_S"], t["vartheta_S"],
+                              t["tau_S_int"], t["vartheta_S_int"])
+                for t in out["tasks"]
+            ], dtype=np.float32)
 
-    def train_episode(self):
-        """Single episode training with DDPG-style actor loss."""
-        self.han.train()
-        self.actor.train()
-        self.critic.train()
-        self.current_episode += 1
+            r_scalar = float(np.mean(task_rewards))
+            self._update_baseline(r_scalar)
 
-        # Generate intent
-        intent_vectors = self._generate_intent_vectors()
-        params = self.curriculum.get_env_params(self.current_episode)
-        system_state = self.env.generate_state()
-        system_state['SCt']['delay_intents'] = [max(0.1, (1.0 - iv[0]) * 5.0) for iv in intent_vectors]
-        system_state['SCt']['quality_intents'] = [iv[1] for iv in intent_vectors]
+            task_adv = task_rewards - self.reward_baseline
+            all_lp.append(per_task_lp.squeeze(0))                          # [Nm]
+            all_adv.append(torch.tensor(task_adv, dtype=torch.float,
+                                        device=self.device))
+            vp_list.append(self.critic(graph_emb.detach()).squeeze())
+            vt_list.append(torch.tensor(r_scalar, device=self.device))
+            ep_rewards.append(r_scalar)
+            ep_isrs.append(compute_isr(out["tasks"]))
 
-        # HAN encoding
-        graph_emb, node_embs, message_embs = self.han.encode_state(
-            system_state, intent_vectors=intent_vectors
-        )
+        lp  = torch.stack(all_lp)    # [B, Nm]
+        adv = torch.stack(all_adv)   # [B, Nm]
 
-        # Actor: generate action
-        action = self.actor(graph_emb, message_embs=message_embs)
+        adv_flat = adv.reshape(-1)
+        adv_std  = adv_flat.std()
+        if adv_std > 1e-6:
+            adv = (adv - adv_flat.mean()) / (adv_std + 1e-8)
+        else:
+            adv = adv - adv_flat.mean()
 
-        # Parse action into dict format expected by environment
-        action_np = action.detach().cpu().numpy()[0]
-        bw = action_np[:self.n_tasks]
-        relay = action_np[self.n_tasks:self.n_tasks + self.n_tasks * self.n_relays].reshape(1, self.n_tasks, self.n_relays)
-        mcs = action_np[self.n_tasks + self.n_tasks * self.n_relays:].reshape(1, self.n_tasks, self.n_mcs)
-        parsed_action = {
-            "bandwidth": bw.reshape(1, self.n_tasks),
-            "relay": relay,
-            "mcs": mcs,
-        }
-
-        # Environment step
-        result = self.env.step(parsed_action, system_state)
-        tasks = result["tasks"]
-
-        # Compute CSCQI reward (Eq. 17)
-        cscqi_values = []
-        for t in tasks:
-            cscqi_values.append(compute_cscqi(
-                t["tau_S"], t["vartheta_S"],
-                t["tau_S_int"], t["vartheta_S_int"],
-                w_tau=0.5, w_vartheta=0.5,
-            ))
-        reward_t = float(np.clip(np.mean(cscqi_values), -5.0, 5.0))
-        isr = compute_isr(tasks)
-
-        # Critic update
-        value_pred = self.critic(graph_emb.detach(), action.detach())
-        value_target = torch.tensor([[reward_t]], device=self.device, dtype=torch.float)
-        critic_loss = nn.MSELoss()(value_pred, value_target)
-
-        self.opt_critic.zero_grad()
-        critic_loss.backward()
-        nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-        self.opt_critic.step()
-
-        # Actor update — DDPG style: maximize Q(s,a)
-        action_new = self.actor(graph_emb, message_embs=message_embs)
-        q_value = self.critic(graph_emb.detach(), action_new)
-        actor_loss = -q_value.mean()
-
-        self.opt_actor.zero_grad()
+        actor_loss = -(lp * adv.detach()).mean()
+        self.opt.zero_grad()
         actor_loss.backward()
-        nn.utils.clip_grad_norm_(
-            list(self.han.parameters()) + list(self.actor.parameters()),
-            self.max_grad_norm
-        )
-        self.opt_actor.step()
+        torch.nn.utils.clip_grad_norm_(
+            list(self.han.parameters()) + list(self.policy.parameters()), 1.0)
+        self.opt.step()
 
-        # Store in replay buffer (for batch training later if needed)
-        # Use dummy next_state (same as state for simplicity)
-        self.replay_buffer.push(graph_emb, action, reward_t, graph_emb)
+        vp          = torch.stack(vp_list)
+        vt          = torch.stack(vt_list)
+        critic_loss = self.mse(vp, vt)
+        self.critic_opt.zero_grad()
+        critic_loss.backward()
+        self.critic_opt.step()
 
-        self.reward_history.append(reward_t)
-        return reward_t, float(critic_loss.item()), float(actor_loss.item()), isr
+        return (float(np.mean(ep_rewards)), float(critic_loss.item()),
+                float(actor_loss.item()), float(np.mean(ep_isrs)), tasks_per_csca)
 
-    def train(self, max_episodes=500, checkpoint_every=100):
-        log(f"Starting MLP training for {max_episodes} episodes on {self.device}")
-        log("Architecture: HAN (3 layers, 256-dim) + MLP Actor (replacing DDPM)")
+    @torch.no_grad()
+    def evaluate_isr(self, tpc_list=(1, 2, 4, 6, 10), n_episodes=50):
+        self.han.eval(); self.policy.eval()
+        results = {}
+        for tpc in tpc_list:
+            congestion_idx = TPC_TO_IDX.get(tpc, 0)
+            isrs = []
+            for _ in range(n_episodes):
+                env   = self._make_env(tpc)
+                state = env.generate_state()
+                intents = [[m[1], m[2]] for m in state["SCt"]["message_features"]]
+                _, _, message_embs = self.han.encode_state(state, intents)
+                action = self.policy(message_embs, congestion_idx)
+                out    = env.step(action, state)
+                isrs.append(compute_isr(out["tasks"]))
+            results[tpc] = (float(np.mean(isrs)), float(np.std(isrs)))
+        self.han.train(); self.policy.train()
+        return results
 
-        for ep in range(1, max_episodes + 1):
-            reward, critic_loss, actor_loss, isr = self.train_episode()
+    def save(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({
+            "han":             self.han.state_dict(),
+            "policy":          self.policy.state_dict(),
+            "critic":          self.critic.state_dict(),
+            "reward_baseline": self.reward_baseline,
+            "warmup_count":    self._warmup_count,
+        }, path)
 
-            if ep % 50 == 0 or ep == 1:
-                avg_reward = np.mean(self.reward_history[-50:]) if self.reward_history else 0
-                log(f"Episode {ep}/{max_episodes} | CSCQI: {reward:.4f} | ISR: {isr:.3f} | "
-                    f"Critic: {critic_loss:.4f} | Actor: {actor_loss:.4f}")
-
-            if ep % checkpoint_every == 0:
-                ckpt = {
-                    "han": self.han.state_dict(),
-                    "actor": self.actor.state_dict(),
-                    "critic": self.critic.state_dict(),
-                    "episode": ep,
-                }
-                path = os.path.join(CHECKPOINT_PATH, f"mlp_ep{ep}.pt")
-                torch.save(ckpt, path)
-                log(f"Checkpoint saved: {path}")
-
-                if isr > self.best_isr:
-                    self.best_isr = isr
-                    best_path = os.path.join(CHECKPOINT_PATH, "mlp_best.pt")
-                    torch.save(ckpt, best_path)
-                    log(f"New best checkpoint: ep{ep}, ISR={isr:.3f}")
-
-        return self.reward_history
-
-
-if __name__ == "__main__":
-    set_seed(42)
-
-    print("=" * 60)
-    print("MLP TRAINING — HAN + MLP Actor-Critic")
-    print("Paper Table II: 500 episodes, batch=256, LR=0.001")
-    print("=" * 60)
-
-    trainer = MLPTrainer()
-    rewards = trainer.train(max_episodes=500, checkpoint_every=100)
-
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    smoothed = np.convolve(rewards, np.ones(20)/20, mode='valid')
-    plt.figure(figsize=(10, 4))
-    plt.plot(rewards, alpha=0.3, color='blue', label='Raw', linewidth=0.8)
-    plt.plot(range(19, len(rewards)), smoothed, 'r-', linewidth=2, label='Smoothed (20ep)')
-    plt.xlabel("Episode")
-    plt.ylabel("CSCQI Reward")
-    plt.title("MLP Training — HAN + MLP Actor-Critic")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(r"D:\MP2\results\software", "mlp_training.png"), dpi=120)
-    plt.close()
-
-    print("=" * 60)
-    print("TRAINING COMPLETE")
-    print(f"Final reward (last 50): {np.mean(rewards[-50:]):.4f}")
-    print(f"Best reward: {max(rewards):.4f}")
-    print("=" * 60)
+    def load(self, path):
+        ckpt = torch.load(path, map_location=self.device)
+        self.han.load_state_dict(ckpt["han"])
+        self.policy.load_state_dict(ckpt["policy"])
+        if "critic" in ckpt:
+            self.critic.load_state_dict(ckpt["critic"])
+        self.reward_baseline = ckpt.get("reward_baseline", 0.0)
+        self._warmup_count   = ckpt.get("warmup_count", self._warmup_episodes)

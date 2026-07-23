@@ -1,35 +1,12 @@
-# Python
+.venv/
 __pycache__/
 *.pyc
-*.pyo
-.venv/
-*.egg-info/
-
-# Checkpoints — only keep best, not every epoch
-results/software/checkpoints/hdm_ep*.pt
-results/software/checkpoints/mlp_ep*.pt
-results/software/checkpoints/sac_*.pt
-results/software/checkpoints/ppo_*.pt
-results/software/checkpoints/ac_*.pt
-
-# Large model files
 models/
-*.bin
-*.safetensors
+data/
+repos/
 all-MiniLM-L6-v2/
-
-# Logs
+checkpoints/
+*.gguf
+*.pth
+*.pt
 log.txt
-*.log
-
-# Archive
-archive/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Data (too large for GitHub)
-data/raw/
-data/processed/
-deepmimo_scenarios/

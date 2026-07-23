@@ -67,18 +67,8 @@ class MLPActor(nn.Module):
 
         # Task-specific BW allocation using per-task embeddings
         if message_embs is not None:
-            # Group message embeddings by CSCA if n_total > n_tasks
-            n_total = message_embs.shape[0]
-            if n_total != self.n_tasks:
-                tasks_per_csca = n_total // self.n_tasks
-                if tasks_per_csca > 0 and n_total % self.n_tasks == 0:
-                    msg_grouped = message_embs.view(self.n_tasks, tasks_per_csca, -1).mean(dim=1)
-                else:
-                    msg_grouped = message_embs[:self.n_tasks]
-            else:
-                msg_grouped = message_embs
             # [n_tasks, 1] -> softmax -> [1, n_tasks]
-            bw_logits = self.task_bw_head(msg_grouped)  # [n_tasks, 1]
+            bw_logits = self.task_bw_head(message_embs)  # [n_tasks, 1]
             bw_alloc = torch.softmax(
                 bw_logits.squeeze(-1) / self.bw_temperature.abs(), dim=0
             ).unsqueeze(0)  # [1, n_tasks]

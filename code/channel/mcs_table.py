@@ -161,6 +161,71 @@ def compute_rate_from_mcs(mcs_entry: dict, bandwidth_hz: float) -> float:
     return mcs_entry["spectral_efficiency"] * bandwidth_hz
 
 
+def compute_mim(token_probs: list) -> float:
+    """
+    Message Importance Measure (Eq. 5).
+    MIM(psi_S) = sum over f: p(f) * exp(-p(f))
+    Higher MIM = message is more predictable/certain = can tolerate higher BER.
+    """
+    if not token_probs:
+        return 0.5
+    total = sum(token_probs)
+    if total <= 0:
+        return 0.5
+    norm_probs = [p / total for p in token_probs]
+    return float(sum(p * np.exp(-p) for p in norm_probs if p > 0))
+
+
+def select_mcs_for_mim_and_sinr(
+    mim: float,
+    sinr_db: float,
+    bw_weight: float = 0.5,
+    table: int = 1,
+) -> dict:
+    """
+    Select MCS satisfying BOTH:
+    1. Spectral efficiency <= Shannon capacity (channel constraint)
+    2. Implied BER <= max_ber = bw_weight * (1 - MIM) (Eq. 6 constraint C3)
+    """
+    max_ber = bw_weight * (1.0 - mim)
+    max_ber = float(np.clip(max_ber, 1e-6, 0.5))
+
+    if max_ber >= 0.05:
+        max_mod_order = 2   # QPSK only
+    elif max_ber >= 0.005:
+        max_mod_order = 4   # up to 16QAM
+    elif max_ber >= 0.0005:
+        max_mod_order = 6   # up to 64QAM
+    else:
+        max_mod_order = 8   # up to 256QAM
+
+    sinr_linear = 10 ** (sinr_db / 10)
+    shannon_eff = np.log2(1 + sinr_linear) * 0.85
+
+    tables = {1: MCS_TABLE_1, 2: MCS_TABLE_2, 3: MCS_TABLE_3}
+    tbl = tables.get(table, MCS_TABLE_1)
+
+    best = tbl[0]
+    for entry in tbl:
+        idx, mod_order, code_rate_x1024, spec_eff = entry
+        if mod_order > max_mod_order:
+            continue
+        if spec_eff > shannon_eff:
+            continue
+        best = entry
+
+    return {
+        "mcs_index": best[0],
+        "modulation_order": best[1],
+        "modulation": MOD_NAMES.get(best[1], f"{best[1]}-QAM"),
+        "code_rate": best[2] / 1024.0,
+        "spectral_efficiency": best[3],
+        "sinr_db": sinr_db,
+        "mim": mim,
+        "max_ber": max_ber,
+    }
+
+
 if __name__ == "__main__":
     print("3GPP TS 38.214 MCS Tables")
     print("=" * 60)

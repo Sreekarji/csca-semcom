@@ -37,6 +37,14 @@ class CSCGraphBuilder:
         self.relay_feat_dim = relay_feat_dim
         self.message_feat_dim = message_feat_dim
 
+        # Fixed topology (computed once, reused every episode)
+        self._csca_idx = torch.arange(n_cscas)
+        self._bs_idx   = torch.arange(n_cscas) % n_base_stations
+        self._msg_idx      = torch.arange(n_messages)
+        self._csca_assign  = torch.arange(n_messages) % n_cscas
+        self._msg_idx2     = torch.arange(n_messages)
+        self._relay_assign = torch.arange(n_messages) % n_relays
+
     def build(self, system_state: dict = None,
               intent_vectors: list = None) -> HeteroData:
         """
@@ -117,25 +125,19 @@ class CSCGraphBuilder:
         data["base_station"].x = bs_feats
         data["init"].x = init_feat
 
-        # csca -> base_station (randomized each episode)
-        csca_idx = torch.arange(n_c)
-        bs_idx = torch.randperm(n_b)[:n_c] if n_b >= n_c else torch.randint(0, n_b, (n_c,))
+        # csca -> base_station (fixed round-robin)
         data["csca", "comm_conn", "base_station"].edge_index = torch.stack(
-            [csca_idx, bs_idx], dim=0
+            [self._csca_idx, self._bs_idx], dim=0
         )
 
-        # message -> csca (randomized each episode)
-        msg_idx = torch.arange(n_m)
-        csca_assign = torch.randperm(n_c)[:n_m] if n_c >= n_m else torch.randint(0, n_c, (n_m,))
+        # message -> csca (fixed round-robin)
         data["message", "comm_req", "csca"].edge_index = torch.stack(
-            [msg_idx, csca_assign], dim=0
+            [self._msg_idx, self._csca_assign], dim=0
         )
 
-        # message -> relay (randomized each episode)
-        msg_idx2 = torch.arange(n_m)
-        relay_assign = torch.randperm(n_r)[:n_m] if n_r >= n_m else torch.randint(0, n_r, (n_m,))
+        # message -> relay (fixed round-robin)
         data["message", "semantic_conn", "relay"].edge_index = torch.stack(
-            [msg_idx2, relay_assign], dim=0
+            [self._msg_idx2, self._relay_assign], dim=0
         )
 
         # init -> all other node types

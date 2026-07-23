@@ -1,289 +1,125 @@
+"""
+FIX 18: DDPM diffusion policy for the FIX-14c action space (BW + MCS, no relay).
+Per-task denoising: each task's 4-dim action chunk (1 BW logit + 3 MCS logits)
+is denoised conditioned on (its own message embedding, global graph embedding,
+timestep). This preserves the per-task information pathway that makes HDM beat
+the baselines, and is task-count agnostic.
+Reverse diffusion uses the reparameterization trick end-to-end, so gradients
+flow: Q -> action -> denoiser -> message_embs -> HAN, exactly like the MLP path.
+Noise schedule: paper Eq. 31-32. Reverse mean: Eq. 30.
+"""
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 
 
-class MLPDenoiser(nn.Module):
-    """
-    MLP-based denoiser for DDPM policy generation.
-    Sun et al. 2026 explicitly uses MLP (not UNet) for faster inference.
-
-    Split architecture:
-    - task_bw_head: per-task BW conditioned on message_embs (task-specific)
-    - global_head: relay + MCS conditioned on graph_emb (global)
-    """
-
-    def __init__(
-        self,
-        action_dim: int = 45,
-        graph_emb_dim: int = 256,
-        task_emb_dim: int = 256,
-        hidden_dim: int = 256,
-        n_denoising_steps: int = 6,
-        n_tasks: int = 5,
-    ):
+class PerTaskDenoiser(nn.Module):
+    """eps_theta(a_n^i, n | msg_emb_i, graph_emb) applied to every task i."""
+    def __init__(self, task_action_dim=4, graph_emb_dim=256,
+                 task_emb_dim=256, hidden_dim=256, n_denoising_steps=6):
         super().__init__()
-        self.action_dim = action_dim
-        self.n_steps = n_denoising_steps
-        self.n_tasks = n_tasks
-
         self.time_emb = nn.Embedding(n_denoising_steps + 1, hidden_dim)
-
-        # Task-specific bandwidth head
-        # Input: per-task embedding + timestep
-        self.task_bw_head = nn.Sequential(
-            nn.Linear(task_emb_dim + hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 1),  # One BW value per task
+        cond_dim = graph_emb_dim + task_emb_dim + hidden_dim
+        self.net = nn.Sequential(
+            nn.Linear(task_action_dim + cond_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, task_action_dim),
         )
+        # Near-zero init so denoiser predicts near-zero noise at init
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                nn.init.zeros_(m.bias)
 
-        # Global policy head for relay + MCS
-        relay_mcs_dim = action_dim - n_tasks
-        self.global_head = nn.Sequential(
-            nn.Linear(graph_emb_dim + hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, relay_mcs_dim),
-        )
-
-    def forward(self, a_n: torch.Tensor, n: int,
-                graph_emb: torch.Tensor,
-                message_embs: torch.Tensor = None):
-        t_emb = self.time_emb(
-            torch.tensor(n, device=a_n.device)
-        ).unsqueeze(0)  # [1, hidden_dim]
-
-        if graph_emb.dim() == 1:
-            graph_emb = graph_emb.unsqueeze(0)
-
-        # Task-specific bandwidth allocation
-        if message_embs is not None:
-            # Average message embeddings across tasks sharing same CSCA
-            # message_embs: [n_total_tasks, 256] — reduce to [n_tasks, 256]
-            n_total = message_embs.shape[0]
-            if n_total != self.n_tasks:
-                # Group tasks by CSCA and average embeddings
-                tasks_per_csca = n_total // self.n_tasks
-                if tasks_per_csca > 0 and n_total % self.n_tasks == 0:
-                    msg_grouped = message_embs.view(self.n_tasks, tasks_per_csca, -1).mean(dim=1)
-                else:
-                    # Fallback: interpolate to n_tasks
-                    msg_grouped = message_embs[:self.n_tasks] if n_total >= self.n_tasks else \
-                                  message_embs.mean(dim=0, keepdim=True).expand(self.n_tasks, -1)
-            else:
-                msg_grouped = message_embs
-            t_emb_expanded = t_emb.expand(msg_grouped.shape[0], -1)
-            task_input = torch.cat([msg_grouped, t_emb_expanded], dim=-1)
-            bw_noise = self.task_bw_head(task_input).T  # [1, n_tasks]
-        else:
-            bw_noise = a_n[:, :self.n_tasks]
-
-        # Global relay + MCS allocation
-        if t_emb.shape[0] != a_n.shape[0]:
-            t_emb = t_emb.expand(a_n.shape[0], -1)
-        if graph_emb.shape[0] != a_n.shape[0]:
-            if graph_emb.shape[0] == 1:
-                graph_emb = graph_emb.expand(a_n.shape[0], -1)
-            else:
-                graph_emb = graph_emb[:a_n.shape[0]]
-
-        global_input = torch.cat([graph_emb, t_emb], dim=-1)
-        relay_mcs_noise = self.global_head(global_input)
-        if relay_mcs_noise.shape[0] != a_n.shape[0]:
-            relay_mcs_noise = relay_mcs_noise.expand(a_n.shape[0], -1)
-
-        # Combine
-        predicted_noise = torch.cat([bw_noise, relay_mcs_noise], dim=-1)
-        return predicted_noise
+    def forward(self, a_n, n, graph_emb, message_embs):
+        # a_n: [Nt, task_action_dim]; graph_emb: [1, 256]; message_embs: [Nt, 256]
+        Nt = a_n.shape[0]
+        t = self.time_emb(torch.tensor(n, dtype=torch.long, device=a_n.device))
+        t = t.unsqueeze(0).expand(Nt, -1)
+        g = graph_emb.expand(Nt, -1)
+        return self.net(torch.cat([a_n, g, message_embs, t], dim=-1))
 
 
-class HDMPolicy(nn.Module):
-    """
-    HDM: HAN + DDPM policy network.
-    Implements Algorithm 2 from Sun et al. 2026.
-    Action space: at = {BWt, Πt, Θt}
-    """
-
-    def __init__(
-        self,
-        action_dim: int = 45,
-        graph_emb_dim: int = 256,
-        n_denoising_steps: int = 6,
-        beta_min: float = 0.01,
-        beta_max: float = 0.5,
-        n_tasks: int = 5,
-    ):
+class DDPMActor(nn.Module):
+    """Drop-in replacement for MLPActor. forward(graph_emb, message_embs) -> [1, action_dim]."""
+    def __init__(self, graph_emb_dim=256, task_emb_dim=256, action_dim=80,
+                 hidden_dim=256, n_tasks=20, n_mcs=3, n_denoising_steps=6,
+                 beta_min=0.01, beta_max=0.5):
         super().__init__()
+        assert action_dim == n_tasks + n_tasks * n_mcs, \
+            f"action_dim {action_dim} != n_tasks({n_tasks}) + n_tasks*n_mcs({n_tasks*n_mcs})"
+        self.n_tasks = n_tasks
+        self.n_mcs = n_mcs
         self.action_dim = action_dim
+        self.task_dim = 1 + n_mcs          # per-task: 1 BW logit + n_mcs MCS logits
         self.N = n_denoising_steps
         self.beta_min = beta_min
         self.beta_max = beta_max
-        self.n_tasks = n_tasks
-
-        self.denoiser = MLPDenoiser(
-            action_dim=action_dim,
-            graph_emb_dim=graph_emb_dim,
-            n_denoising_steps=n_denoising_steps,
-            n_tasks=n_tasks,
-        )
-
-        # Precompute noise schedule (Eq. 31-32)
+        self.denoiser = PerTaskDenoiser(self.task_dim, graph_emb_dim,
+                                        task_emb_dim, hidden_dim, n_denoising_steps)
+        self.bw_temperature = nn.Parameter(torch.tensor(1.0))
         self._build_schedule()
 
     def _build_schedule(self):
+        # Paper Eq. 31-32
         betas = []
         for n in range(1, self.N + 1):
             beta_n = 1.0 - np.exp(
                 -(self.beta_min / self.N)
-                - (2 * n - 1) / (2 * self.N ** 2) * (self.beta_max - self.beta_min)
-            )
+                - (2 * n - 1) / (2 * self.N ** 2) * (self.beta_max - self.beta_min))
             betas.append(beta_n)
-
         betas = torch.tensor(betas, dtype=torch.float32)
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
-
+        beta_tilde = torch.zeros_like(betas)
+        beta_tilde[0] = betas[0]
+        for n in range(1, self.N):
+            beta_tilde[n] = ((1.0 - alphas_cumprod[n - 1])
+                             / (1.0 - alphas_cumprod[n]) * betas[n])
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", alphas)
         self.register_buffer("alphas_cumprod", alphas_cumprod)
+        self.register_buffer("beta_tilde", beta_tilde)
 
-    def collect_trajectory(self, graph_emb: torch.Tensor,
-                           message_embs: torch.Tensor = None,
-                           batch_size: int = 1):
-        """
-        Paper-faithful log_prob: Eq. 28-29.
-        Record μ_θ(a_n, n, G^L_t) at each actual denoising step.
-        log π_θ(a_t|s_t) = Σ_{n=1}^{N} log N(a_{n-1}; μ_θ, β̃_n I)
-        """
+    def reverse_diffusion(self, graph_emb, message_embs, deterministic=False):
         device = graph_emb.device
         if graph_emb.dim() == 1:
             graph_emb = graph_emb.unsqueeze(0)
-        if graph_emb.shape[0] == 1 and batch_size > 1:
-            graph_emb = graph_emb.expand(batch_size, -1)
-
-        # Run full trajectory WITH gradients, recording μ_θ at each step
-        a_n = torch.randn(batch_size, self.action_dim, device=device)
-        
-        mu_list = []
-        a_list = [a_n]  # a_N is the starting point
-
+        a_n = torch.randn(self.n_tasks, self.task_dim, device=device)
         for n in range(self.N, 0, -1):
             beta_n = self.betas[n - 1]
             alpha_n = self.alphas[n - 1]
-            alpha_cumprod_n = self.alphas_cumprod[n - 1]
-
-            # Predict noise WITH gradients (so actor loss flows through denoiser)
-            pred_noise = self.denoiser(a_n, n, graph_emb, message_embs=message_embs)
-
-            # Eq. 30: μ_θ(a_n, n, G^L_t)
-            coeff = beta_n / torch.sqrt(1.0 - alpha_cumprod_n)
-            mu = (1.0 / torch.sqrt(alpha_n)) * (a_n - coeff * pred_noise)
-            mu_list.append(mu)
-
-            if n > 1:
-                # Eq. 29: posterior variance β̃_n
-                alpha_cumprod_prev = self.alphas_cumprod[n - 2]
-                beta_tilde_n = (1.0 - alpha_cumprod_prev) / (1.0 - alpha_cumprod_n) * beta_n
-                noise = torch.randn_like(a_n)
-                a_n = mu.detach() + torch.sqrt(beta_tilde_n) * noise
-            else:
-                a_n = mu.detach()
-            a_list.append(a_n)
-
-        a_0 = torch.sigmoid(a_n)
-
-        # Eq. 28-29: log π_θ = Σ_{n=1}^{N} log N(a_{n-1}; μ_θ(a_n,n,G), β̃_n I)
-        log_prob = torch.zeros(batch_size, 1, device=device)
-        for i, (mu_i, beta_i_idx) in enumerate(zip(mu_list, range(self.N - 1, -1, -1))):
-            beta_n = self.betas[beta_i_idx]
-            alpha_cumprod_n = self.alphas_cumprod[beta_i_idx]
-            if beta_i_idx > 0:
-                alpha_cumprod_prev = self.alphas_cumprod[beta_i_idx - 1]
-                beta_tilde_n = (1.0 - alpha_cumprod_prev) / (1.0 - alpha_cumprod_n) * beta_n
-            else:
-                beta_tilde_n = beta_n
-            # a_{n-1} is a_list[i+1]
-            a_prev = a_list[i + 1].detach()
-            # log N(a_{n-1}; μ_i, β̃_n I) = -0.5 * ||a_{n-1} - μ_i||² / β̃_n
-            diff = a_prev - mu_i
-            log_prob_step = -0.5 * (diff ** 2 / (beta_tilde_n + 1e-8)).sum(dim=-1, keepdim=True)
-            log_prob = log_prob + log_prob_step
-
-        # Normalize by both N (steps) and action_dim to keep actor_loss in [-1, 1] range
-        # Without this: log_prob ≈ -19.5, actor_loss ≈ ±58, training oscillates
-        # With this: log_prob ≈ -0.07, actor_loss ≈ ±0.2, training is stable
-        log_prob = log_prob / (self.N * self.action_dim)
-        return a_0.detach(), log_prob
-
-    def reverse_diffusion(self, graph_emb: torch.Tensor,
-                          message_embs: torch.Tensor = None,
-                          batch_size: int = 1):
-        """
-        Reverse denoising process: a_N ~ N(0,I) -> a_0
-        Eq. 28-30 from paper.
-        """
-        device = graph_emb.device
-        a_n = torch.randn(batch_size, self.action_dim, device=device)
-
-        for n in range(self.N, 0, -1):
-            beta_n = self.betas[n - 1]
-            alpha_n = self.alphas[n - 1]
-            alpha_cumprod_n = self.alphas_cumprod[n - 1]
-
-            predicted_noise = self.denoiser(
-                a_n, n, graph_emb, message_embs=message_embs
-            )
-
-            # Eq. 30: compute mean
-            coeff = beta_n / torch.sqrt(1.0 - alpha_cumprod_n)
-            mean = (1.0 / torch.sqrt(alpha_n)) * (a_n - coeff * predicted_noise)
-
-            if n > 1:
-                # Eq. 29: posterior variance beta_tilde_n
-                alpha_cumprod_prev = self.alphas_cumprod[n - 2]
-                beta_tilde_n = (1.0 - alpha_cumprod_prev) / (1.0 - alpha_cumprod_n) * beta_n
-                noise = torch.randn_like(a_n)
-                a_n = mean + torch.sqrt(beta_tilde_n) * noise
+            abar_n = self.alphas_cumprod[n - 1]
+            eps = self.denoiser(a_n, n, graph_emb, message_embs)
+            mean = (1.0 / torch.sqrt(alpha_n)) * (
+                a_n - (beta_n / torch.sqrt(1.0 - abar_n)) * eps)   # Eq. 30
+            if n > 1 and not deterministic:
+                a_n = mean + torch.sqrt(self.beta_tilde[n - 1]) * torch.randn_like(a_n)
             else:
                 a_n = mean
+        return a_n                                                 # [Nt, task_dim]
 
-        # Normalize action to [0, 1]
-        a_0 = torch.sigmoid(a_n)
-        return a_0
-
-    def forward(self, graph_emb: torch.Tensor,
-                message_embs: torch.Tensor = None):
-        return self.reverse_diffusion(graph_emb, message_embs=message_embs)
-
-    def parse_action(self, a_0: torch.Tensor, n_tasks: int = 5, n_relays: int = 5, n_mcs: int = 3):
-        bw = a_0[:, :n_tasks]
-        relay = a_0[:, n_tasks:n_tasks + n_tasks * n_relays].reshape(-1, n_tasks, n_relays)
-        mcs = a_0[:, n_tasks + n_tasks * n_relays:].reshape(-1, n_tasks, n_mcs)
-        return {"bandwidth": bw, "relay": relay, "mcs": mcs}
+    def forward(self, graph_emb, message_embs=None, deterministic=False):
+        if message_embs is None:
+            raise ValueError("DDPMActor requires per-task message_embs from HAN")
+        raw = self.reverse_diffusion(graph_emb, message_embs, deterministic)
+        bw = torch.softmax(raw[:, 0] / self.bw_temperature.abs().clamp_min(0.1),
+                           dim=0).unsqueeze(0)                      # [1, Nt]
+        mcs = torch.sigmoid(raw[:, 1:]).reshape(1, -1)              # [1, Nt*n_mcs]
+        return torch.cat([bw, mcs], dim=-1)                         # [1, action_dim]
 
 
-class CriticNetwork(nn.Module):
-    def __init__(self, state_dim: int = 256, action_dim: int = 45, hidden_dim: int = 256):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, graph_emb: torch.Tensor, action: torch.Tensor):
-        if graph_emb.shape[0] != action.shape[0]:
-            if graph_emb.shape[0] == 1:
-                graph_emb = graph_emb.expand(action.shape[0], -1)
-            elif action.shape[0] == 1:
-                action = action.expand(graph_emb.shape[0], -1)
-            else:
-                raise ValueError(
-                    f"CriticNetwork batch size mismatch: "
-                    f"graph_emb={graph_emb.shape}, action={action.shape}"
-                )
-        inp = torch.cat([graph_emb, action], dim=-1)
-        return self.net(inp)
+if __name__ == "__main__":
+    # Smoke test
+    actor = DDPMActor(n_tasks=20, n_mcs=3)
+    ge = torch.randn(1, 256)
+    me = torch.randn(20, 256)
+    out = actor(ge, message_embs=me)
+    assert out.shape == (1, 80), f"Shape mismatch: {out.shape}"
+    assert abs(out[0, :20].sum().item() - 1.0) < 0.01, f"BW doesn't sum to 1: {out[0,:20].sum()}"
+    # Check gradient flow
+    loss = -out.sum()
+    loss.backward()
+    gnorm = sum(p.grad.norm().item() for p in actor.denoiser.parameters() if p.grad is not None)
+    assert gnorm > 0, f"No gradient! gnorm={gnorm}"
+    print(f"DDPMActor smoke test PASSED: shape={out.shape}, BW sum={out[0,:20].sum():.4f}, grad_norm={gnorm:.4f}")

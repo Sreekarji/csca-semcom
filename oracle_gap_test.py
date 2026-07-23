@@ -1,86 +1,65 @@
+"""Oracle-gap sanity check.
+Run: python oracle_gap_test.py
 """
-Oracle Gap Test: proves uniform BW allocation is suboptimal at high task counts.
-If oracle >> uniform, there IS a learning problem worth solving.
-If oracle ≈ uniform, the environment is fundamentally degenerate.
-"""
-import sys, os
+import os
+import sys
+import copy
 import numpy as np
 import torch
-import csv
 
-sys.path.insert(0, r"D:\MP2\code\channel")
-sys.path.insert(0, r"D:\MP2\code\evaluation")
+BASE = os.path.dirname(os.path.abspath(__file__))
+for sub in ["", "code/hdm", "code/channel", "code/evaluation", "code/utils"]:
+    p = os.path.join(BASE, sub)
+    if os.path.isdir(p):
+        sys.path.insert(0, p)
+
 from sim_channel import MultiCSCAEnvironment
-from cscqi import compute_isr, compute_cscqi
+from cscqi import compute_isr
 
-def oracle_allocation(state, env, n_trials=20):
-    """
-    Oracle: try n_trials random BW allocations, pick the one that maximizes ISR.
-    This upper-bounds what any learned policy can achieve.
-    """
-    best_isr = 0.0
-    best_action = None
-    for _ in range(n_trials):
-        # Random non-uniform allocation (Dirichlet gives valid distribution)
-        bw_raw = np.random.dirichlet(np.ones(env.n_cscas))
-        bw_t = torch.tensor(bw_raw, dtype=torch.float).unsqueeze(0)
-        relay_t = torch.rand(1, env.n_cscas * env.n_relays).reshape(1, env.n_cscas, env.n_relays)
-        mcs_t = torch.rand(1, env.n_cscas * 3).reshape(1, env.n_cscas, 3)
-        action = {"bandwidth": bw_t, "relay": relay_t, "mcs": mcs_t}
-        result = env.step(action, state)
-        isr = compute_isr(result["tasks"])
-        if isr > best_isr:
-            best_isr = isr
-            best_action = action
-    return best_isr
+N_STATES        = 100
+N_ORACLE_SAMPLES = 64
+TPC_LIST        = [1, 2, 4, 10]
 
-def uniform_allocation(state, env):
-    """Static uniform: equal BW to all CSCAs."""
-    bw_t = torch.ones(1, env.n_cscas) * (1.0 / env.n_cscas)
-    relay_t = torch.ones(1, env.n_cscas, env.n_relays) * 0.5
-    mcs_t = torch.ones(1, env.n_cscas, 3) * 0.5
-    action = {"bandwidth": bw_t, "relay": relay_t, "mcs": mcs_t}
-    result = env.step(action, state)
-    return compute_isr(result["tasks"])
+def _action_from_bw(bw_vec, n_relays, n_mcs, device):
+    n = len(bw_vec)
+    return {
+        "bandwidth": torch.log(
+            torch.tensor(bw_vec, dtype=torch.float, device=device) + 1e-8
+        ).unsqueeze(0),
+        "relay": torch.zeros(1, n, n_relays, device=device),
+        "mcs":   torch.tensor([[[0.0, 1.0, 0.0]] * n], device=device),
+    }
 
-print("="*60)
-print("ORACLE GAP TEST")
-print("="*60)
+def main():
+    device = "cpu"
+    print(f"{'tpc':>4} {'uniform':>9} {'oracle':>9} {'gap':>9}")
+    for tpc in TPC_LIST:
+        unis, oracles = [], []
+        for s in range(N_STATES):
+            np.random.seed(1000 + s)
+            env   = MultiCSCAEnvironment(difficulty="medium", tasks_per_csca=tpc)
+            state = env.generate_state()
+            n     = env.n_tasks
 
-results = []
-n_episodes = 100
-tasks_per_csca_list = [1, 2, 4, 6, 8, 10, 12, 15, 20]
+            st  = copy.deepcopy(state)
+            uni = compute_isr(env.step(
+                _action_from_bw([1.0] * n, env.n_relays, env.n_mcs, device), st
+            )["tasks"])
+            unis.append(uni)
 
-for tpc in tasks_per_csca_list:
-    env = MultiCSCAEnvironment(
-        n_cscas=5, n_relays=5, bandwidth_total_hz=5e6,
-        difficulty="hard", tasks_per_csca=tpc
-    )
-    oracle_isrs = []
-    uniform_isrs = []
-    for ep in range(n_episodes):
-        np.random.seed(ep)
-        state = env.generate_state()
-        oracle_isrs.append(oracle_allocation(state, env, n_trials=50))
-        np.random.seed(ep)
-        state = env.generate_state()
-        uniform_isrs.append(uniform_allocation(state, env))
-    
-    mean_oracle = np.mean(oracle_isrs)
-    mean_uniform = np.mean(uniform_isrs)
-    gap = mean_oracle - mean_uniform
-    gap_pct = gap / max(mean_uniform, 1e-8) * 100
-    
-    print(f"tasks_per_csca={tpc:2d} | Oracle={mean_oracle:.4f} | Uniform={mean_uniform:.4f} | Gap={gap:+.4f} ({gap_pct:+.1f}%)")
-    results.append([tpc, tpc*5, mean_oracle, mean_uniform, gap, gap_pct])
+            best = -1.0
+            for k in range(N_ORACLE_SAMPLES):
+                np.random.seed(2000 + s * 100 + k)
+                bw  = np.random.dirichlet(np.ones(n))
+                st  = copy.deepcopy(state)
+                isr = compute_isr(env.step(
+                    _action_from_bw(bw.tolist(), env.n_relays, env.n_mcs, device), st
+                )["tasks"])
+                best = max(best, isr)
+            oracles.append(best)
 
-print("\nKey diagnostic:")
-print("- If Gap > 0.05 at tpc>=10: learning problem exists, fix the training")
-print("- If Gap ≈ 0 at all tpc: environment is fundamentally degenerate")
+        u, o = np.mean(unis), np.mean(oracles)
+        print(f"{tpc:>4} {u:>9.3f} {o:>9.3f} {o - u:>+9.3f}")
 
-os.makedirs(r"D:\MP2\results\software", exist_ok=True)
-with open(r"D:\MP2\results\software\oracle_gap_test.csv", "w", newline="") as f:
-    w = csv.writer(f)
-    w.writerow(["tasks_per_csca", "total_tasks", "oracle_isr", "uniform_isr", "gap", "gap_pct"])
-    w.writerows(results)
-print("Saved: D:\\MP2\\results\\software\\oracle_gap_test.csv")
+if __name__ == "__main__":
+    main()

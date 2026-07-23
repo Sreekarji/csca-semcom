@@ -1,0 +1,46 @@
+============================================================
+CSCA-SemCom Final Results
+Policy: DDPM
+Generated: 2026-07-23 23:31:06
+============================================================
+
+--- tpc=1 (5 tasks) ---
+  HDM        ISR=0.7650 +/- 0.1737 <-- HDM
+  AC         ISR=0.7310 +/- 0.1955
+  PPO        ISR=0.7510 +/- 0.1806
+  SAC        ISR=0.7690 +/- 0.1626
+  Static     ISR=0.7120 +/- 0.1807 <-- baseline
+  HDM vs Static: +7.4%
+  HDM vs best RL baseline: -0.5%
+
+--- tpc=2 (10 tasks) ---
+  HDM        ISR=0.5675 +/- 0.1385 <-- HDM
+  AC         ISR=0.3795 +/- 0.1369
+  PPO        ISR=0.3695 +/- 0.1497
+  SAC        ISR=0.3640 +/- 0.1460
+  Static     ISR=0.3440 +/- 0.1444 <-- baseline
+  HDM vs Static: +65.0%
+  HDM vs best RL baseline: +49.5%
+
+--- tpc=4 (20 tasks) ---
+  HDM        ISR=0.3987 +/- 0.0949 <-- HDM
+  AC         ISR=0.1165 +/- 0.0660
+  PPO        ISR=0.1623 +/- 0.0807
+  SAC        ISR=0.1757 +/- 0.0822
+  Static     ISR=0.1237 +/- 0.0661 <-- baseline
+  HDM vs Static: +222.2%
+  HDM vs best RL baseline: +126.9%
+
+--- tpc=10 (50 tasks) ---
+  HDM        ISR=0.1411 +/- 0.0472 <-- HDM
+  AC         ISR=0.0929 +/- 0.0368
+  PPO        ISR=0.0936 +/- 0.0330
+  SAC        ISR=0.0941 +/- 0.0336
+  Static     ISR=0.0888 +/- 0.0313 <-- baseline
+  HDM vs Static: +58.9%
+  HDM vs best RL baseline: +49.9%
+
+============================================================
+HDM improvement over Static at tpc=4: +222.2%
+HDM improvement over best RL baseline at tpc=4: +126.9%
+============================================================

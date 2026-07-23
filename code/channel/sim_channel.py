@@ -28,7 +28,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from mcs_table import select_mcs_for_sinr, compute_rate_from_mcs
+from mcs_table import select_mcs_for_sinr, compute_rate_from_mcs, select_mcs_for_mim_and_sinr, get_mcs_entry
 from cscqi import adjust_intent
 from relay_selection import (
     SemanticRelay, select_relay as relay_select,
@@ -52,7 +52,7 @@ INTERFERENCE_CELLS = 6          # top-K interferers, Section IV.A.3
 # ---------------------------------------------------------------------------
 # BW allocation constant — controls how sharply HDM output maps to BW
 # ---------------------------------------------------------------------------
-BW_SOFTMAX_TEMP = 0.5   # sharper differentiation: 2x logit diff → 4x BW diff
+BW_SOFTMAX_TEMP = 1.0   # was 0.3 — too sharp, made softmax near-argmax
 
 
 class WirelessChannel:
@@ -228,6 +228,7 @@ class WirelessChannel:
         los: bool = True,
         use_mcs_table: bool = True,
         target_snr_db: float = None,
+        mim: float = 0.5,
     ) -> dict:
         """
         Simulate one transmission link.
@@ -265,7 +266,7 @@ class WirelessChannel:
             "distortion":    distortion,
         }
         if use_mcs_table:
-            mcs = select_mcs_for_sinr(sinr_db)
+            mcs = select_mcs_for_mim_and_sinr(mim, sinr_db)
             result.update({
                 "mcs_index":           mcs["mcs_index"],
                 "modulation":          mcs["modulation"],
@@ -331,7 +332,7 @@ class MultiCSCAEnvironment:
         n_relays: int          = 5,
         n_base_stations: int   = 5,
         n_mcs: int             = 3,
-        bandwidth_total_hz: float = 5e6,
+        bandwidth_total_hz: float = 20e6,
         difficulty: str        = "hard",
         tasks_per_csca: int    = 1,
     ):
@@ -387,22 +388,22 @@ class MultiCSCAEnvironment:
         }
 
         if self.difficulty == "hard":
-            delay_intents   = np.random.uniform(0.2, 0.6, self.n_tasks).tolist()
-            quality_intents = np.random.uniform(0.50, 0.70, self.n_tasks).tolist()
-            data_sizes      = (np.random.rand(self.n_tasks) * 0.2e6 + 0.1e6).tolist()
+            delay_intents   = np.random.uniform(0.05, 0.3, self.n_tasks).tolist()
+            quality_intents = np.random.uniform(0.92, 1.00, self.n_tasks).tolist()
+            data_sizes      = (np.random.rand(self.n_tasks) * 0.5e6 + 0.1e6).tolist()
         elif self.difficulty == "medium":
-            delay_intents   = np.random.uniform(0.5, 1.2, self.n_tasks).tolist()
-            quality_intents = np.random.uniform(0.55, 0.75, self.n_tasks).tolist()
-            data_sizes      = (np.random.rand(self.n_tasks) * 0.2e6 + 0.1e6).tolist()
+            delay_intents   = np.random.uniform(0.1, 0.6, self.n_tasks).tolist()
+            quality_intents = np.random.uniform(0.90, 0.97, self.n_tasks).tolist()
+            data_sizes      = (np.random.rand(self.n_tasks) * 0.4e6 + 0.1e6).tolist()
         else:  # easy
-            delay_intents   = np.random.uniform(0.6, 1.5, self.n_tasks).tolist()
-            quality_intents = np.random.uniform(0.60, 0.80, self.n_tasks).tolist()
-            data_sizes      = (np.random.rand(self.n_tasks) * 0.2e6 + 0.1e6).tolist()
+            delay_intents   = np.random.uniform(0.3, 1.0, self.n_tasks).tolist()
+            quality_intents = np.random.uniform(0.88, 0.95, self.n_tasks).tolist()
+            data_sizes      = (np.random.rand(self.n_tasks) * 0.3e6 + 0.1e6).tolist()
 
         # Message features encode real task information for CSC graph
         msg_feats = []
         for i in range(self.n_tasks):
-            ds_norm = min(data_sizes[i] / 5e5, 1.0)
+            ds_norm = min(data_sizes[i] / 6e5, 1.0)
             di      = delay_intents[i] / 5.0
             qi      = quality_intents[i]
             urgency = (1.0 - di) * 0.5 + (1.0 - qi) * 0.5
@@ -440,7 +441,7 @@ class MultiCSCAEnvironment:
 
         msg_feats = []
         for i in range(self.n_tasks):
-            ds_norm = min(data_sizes[i] / 5e5, 1.0)
+            ds_norm = min(data_sizes[i] / 6e5, 1.0)
             di = delay_intents[i] / 5.0
             qi = quality_intents[i]
             urgency = (1.0 - di) * 0.5 + (1.0 - qi) * 0.5
@@ -502,6 +503,9 @@ class MultiCSCAEnvironment:
                 SCt["delay_intents"][i] = adjusted_delay
                 SCt["quality_intents"][i] = adjusted_quality
 
+        # Queuing delay tau_w (Eq. 16) — added to actual delay
+        tau_w_actual = max(0.0, traffic_load - 0.5) * 0.05  # seconds
+
         # Build relay objects
         relays = []
         for r_idx in range(self.n_relays):
@@ -514,20 +518,17 @@ class MultiCSCAEnvironment:
             relays.append(SemanticRelay(r_idx, pos, kb))
 
         # ----------------------------------------------------------------
-        # SOFTMAX BW ALLOCATION  (replaces proportional normalisation)
+        # BW ALLOCATION — per-task softmax (FIX 14a)
         # ----------------------------------------------------------------
-        raw_logits = [
-            float(action["bandwidth"][0, i].item())
-            for i in range(self.n_cscas)
-        ]
-        csca_bw = _softmax_bw_allocation(
+        bw_tensor = action["bandwidth"][0]  # [n_tasks] or [n_cscas]
+        if bw_tensor.shape[0] >= self.n_tasks:
+            raw_logits = [float(bw_tensor[i].item()) for i in range(self.n_tasks)]
+        else:
+            # Legacy fallback: n_cscas logits → expand to n_tasks
+            raw_logits = [float(bw_tensor[i % self.n_cscas].item()) for i in range(self.n_tasks)]
+        bw_allocations = _softmax_bw_allocation(
             raw_logits, self.bandwidth_total, temperature=BW_SOFTMAX_TEMP
         )
-        # Map CSCA BW to tasks: each CSCA's BW shared among its tasks
-        bw_allocations = []
-        for task_i in range(self.n_tasks):
-            csca_i = task_i % self.n_cscas
-            bw_allocations.append(csca_bw[csca_i] / self.tasks_per_csca)
         # ----------------------------------------------------------------
 
         results = []
@@ -574,6 +575,20 @@ class MultiCSCAEnvironment:
                 target_snr_db      = target_snr_db,
             )
 
+            # Hook MCS action from HDM — override SINR-selected MCS
+            if "mcs" in action and action["mcs"] is not None:
+                mcs_probs = action["mcs"][0, min(i, action["mcs"].shape[1]-1), :]   # FIX 14b: per-task
+                mcs_choice_idx = int(mcs_probs.argmax().item())       # 0, 1, or 2
+                mcs_index_map = [0, 10, 20]   # QPSK low, 16QAM mid, 64QAM high
+                chosen_mcs_idx = mcs_index_map[min(mcs_choice_idx, len(mcs_index_map)-1)]
+                chosen_mcs = get_mcs_entry(chosen_mcs_idx)
+                override_rate = compute_rate_from_mcs(chosen_mcs, bw_alloc)
+                override_rate = max(override_rate, 1e3)
+                delay = SCt["data_sizes"][i] / override_rate
+                metrics["mcs_index"] = chosen_mcs_idx
+                metrics["modulation"] = chosen_mcs["modulation"]
+                metrics["rate_bps"] = override_rate
+
             # Relay selection (Eq. 15 approximation)
             relay_info = relay_select(
                 distortion_direct  = metrics["distortion"],
@@ -594,10 +609,10 @@ class MultiCSCAEnvironment:
                 delay = delay + recovery_delay
 
             results.append({
-                "tau_S":          delay,
+                "tau_S":          delay + tau_w_actual,
                 "vartheta_S":     distortion,
                 "tau_S_int":      SCt["delay_intents"][i],
-                "vartheta_S_int": SCt["quality_intents"][i],
+                "vartheta_S_int": 1.0 - SCt["quality_intents"][i],  # quality→distortion scale
                 "sinr_db":        metrics["sinr_db"],
                 "rate_bps":       metrics["rate_bps"],
                 "bw_alloc_hz":    bw_alloc,                  # for logging/debug
@@ -663,7 +678,7 @@ class HighPressureEnvironment(MultiCSCAEnvironment):
 
         msg_feats = []
         for i in range(self.n_tasks):
-            ds_norm = min(data_sizes[i] / 5e5, 1.0)
+            ds_norm = min(data_sizes[i] / 6e5, 1.0)
             di = delay_intents[i] / 5.0
             qi = quality_intents[i]
             urgency = (1.0 - di) * 0.5 + (1.0 - qi) * 0.5
